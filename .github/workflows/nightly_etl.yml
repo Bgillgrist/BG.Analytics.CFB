@@ -29,3 +29,11 @@ jobs:
           # SEASON: "2025"   # uncomment to pin a season
         run: |
           python update_current_season.py
+
+      - name: Update team advanced season stats
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+        run: |
+          python update_team_advanced_stats.py
