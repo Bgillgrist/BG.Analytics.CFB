@@ -8,13 +8,17 @@ from io import StringIO
 PG_DSN = os.getenv("PG_DSN")
 
 # Constants
-CURRENT_SEASON = 2025
-API_URL = f"https://api.collegefootballdata.com/stats/season/advanced?year={CURRENT_SEASON}"
+def current_cfb_season(today_utc: dt.date) -> int:
+    """Return current season (CFB seasons start in August)."""
+    return today_utc.year if today_utc.month >= 8 else today_utc.year - 1
+
+SEASON = int(os.getenv("SEASON") or current_cfb_season(dt.datetime.utcnow().date()))
+API_URL = f"https://api.collegefootballdata.com/stats/season/advanced?year={SEASON}"
 
 # Headers if you use the CFBD API (insert your key if needed)
 HEADERS = {"Authorization": f"Bearer {os.getenv('CFBD_API_KEY', '')}"}
 
-print(f"Fetching team advanced stats for {CURRENT_SEASON}...")
+print(f"Fetching team advanced stats for {SEASON}...")
 
 resp = requests.get(API_URL, headers=HEADERS)
 resp.raise_for_status()
@@ -53,14 +57,14 @@ with psycopg.connect(PG_DSN) as conn:
         # Delete existing season first
         cur.execute(
             "DELETE FROM public.team_advanced_season_stats WHERE season = %s;",
-            (CURRENT_SEASON,),
+            (SEASON,),
         )
-        print(f"Deleted existing rows for season {CURRENT_SEASON}")
+        print(f"Deleted existing rows for season {SEASON}")
 
         # Load new rows
         with cur.copy(COPY_SQL) as cp:
             cp.write(csv_buffer.getvalue().encode("utf-8"))
         conn.commit()
 
-        cur.execute("SELECT COUNT(*) FROM public.team_advanced_season_stats WHERE season = %s;", (CURRENT_SEASON,))
-        print(f"✅ Inserted {cur.fetchone()[0]} rows for {CURRENT_SEASON}")
+        cur.execute("SELECT COUNT(*) FROM public.team_advanced_season_stats WHERE season = %s;", (SEASON,))
+        print(f"✅ Inserted {cur.fetchone()[0]} rows for {SEASON}")
