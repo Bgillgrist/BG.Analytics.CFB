@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg
 import pandas as pd
+import datetime as dt
 from io import StringIO
 
 # Connect to your Neon DB
