@@ -1,0 +1,86 @@
+name: Import Returning Production (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Season year (e.g., 2026)"
+        required: true
+        type: number
+      path:
+        description: "Optional CSV path (defaults to data/returning_production/<season>.csv)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  import-returning-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 🧾 Check out repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install psycopg[binary]
+
+      - name: 📥 Import returning production CSV
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          INPUT_SEASON: ${{ github.event.inputs.season }}
+          INPUT_PATH: ${{ github.event.inputs.path }}
+        run: |
+          python - <<'PY'
+          import os, sys, psycopg
+
+          season = int(os.environ["INPUT_SEASON"])
+          path = os.environ.get("INPUT_PATH") or f"data/returning_production/{season}.csv"
+
+          if not os.path.exists(path):
+            sys.exit(f"❌ CSV not found at: {path}\nCommit the file to the repo or provide a full path via the 'path' input.")
+
+          COPY_SQL = """
+          COPY public.team_returning_production (
+            season, team, conference,
+            total_ppa, total_passing_ppa, total_receiving_ppa, total_rushing_ppa,
+            percent_ppa, percent_passing_ppa, percent_receiving_ppa, percent_rushing_ppa,
+            usage, passing_usage, receiving_usage, rushing_usage
+          )
+          FROM STDIN WITH (
+            FORMAT CSV,
+            HEADER TRUE,
+            DELIMITER ',',
+            NULL '',
+            FORCE_NULL (
+              season,
+              total_ppa, total_passing_ppa, total_receiving_ppa, total_rushing_ppa,
+              percent_ppa, percent_passing_ppa, percent_receiving_ppa, percent_rushing_ppa,
+              usage, passing_usage, receiving_usage, rushing_usage
+            )
+          )
+          """
+
+          print(f"📄 Using CSV: {path}")
+          with psycopg.connect(os.environ["PG_DSN"]) as conn, conn.cursor() as cur:
+              # Clear the target season
+              cur.execute("DELETE FROM public.team_returning_production WHERE season = %s;", (season,))
+              print(f"🗑️  Deleted existing rows for season {season}")
+
+              # Bulk COPY
+              with open(path, "rb") as f, cur.copy(COPY_SQL) as cp:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      cp.write(chunk)
+              conn.commit()
+
+              # Verify
+              cur.execute("SELECT COUNT(*) FROM public.team_returning_production WHERE season = %s;", (season,))
+              cnt = cur.fetchone()[0]
+              print(f"✅ Inserted {cnt} rows for {season}")
+          PY
