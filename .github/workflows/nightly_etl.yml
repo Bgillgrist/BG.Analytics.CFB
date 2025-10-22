@@ -37,3 +37,12 @@ jobs:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
         run: |
           python update_team_advanced_stats.py
+
+      - name: Update team advanced *game* stats
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          # SEASON: "2025"   # optional override for backfills
+        run: |
+          python update_team_advanced_game_stats.py
