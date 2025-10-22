@@ -1,0 +1,46 @@
+name: Import Talent Ratings (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Season year (e.g., 2026)"
+        required: true
+        type: number
+
+jobs:
+  import-talent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        working-directory: etl
+        run: |
+          python -m pip install --upgrade pip
+          pip install psycopg[binary]
+      - name: Import {year} talent ratings
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+        run: |
+          python - <<'PY'
+          import os, psycopg
+          year = int("${{ github.event.inputs.year }}")
+          path = f"data/talent/{year}.csv"
+          if not os.path.exists(path):
+              raise SystemExit(f"Missing file: {path} (commit {year}.csv to data/talent/)")
+          copy_sql = """
+          COPY public.team_talent_composite (year, team, talent)
+          FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',', NULL '', FORCE_NULL (year, talent))
+          """
+          with psycopg.connect(os.getenv("PG_DSN")) as conn, conn.cursor() as cur:
+              cur.execute("DELETE FROM public.team_talent_composite WHERE year = %s;", (year,))
+              print(f"Deleted existing rows for year {year}")
+              with open(path, "rb") as f, cur.copy(copy_sql) as cp:
+                  for chunk in iter(lambda: f.read(1024*1024), b""): cp.write(chunk)
+              conn.commit()
+              cur.execute("SELECT COUNT(*) FROM public.team_talent_composite WHERE year = %s;", (year,))
+              print("Inserted rows for", year, ":", cur.fetchone()[0])
+          PY
