@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import requests
 import psycopg
 import pandas as pd
@@ -14,7 +15,6 @@ def current_cfb_season(today_utc: dt.date) -> int:
 
 SEASON = int(os.getenv("SEASON") or current_cfb_season(dt.datetime.utcnow().date()))
 
-# CFBD game-level advanced team stats
 API_URL = "https://api.collegefootballdata.com/stats/game/advanced"
 HEADERS = {"Authorization": f"Bearer {CFBD_API_KEY}"} if CFBD_API_KEY else {}
 PARAMS = {"year": SEASON}
@@ -27,13 +27,24 @@ print(f"Retrieved {len(data)} rows.")
 
 df = pd.json_normalize(data)
 
-# ---- normalize headers to snake_case that matches your table ----
+# --- robust camelCase -> snake_case (and spaces -> underscores) ---
 def to_snake(s: str) -> str:
-    return s.strip().lower().replace(" ", "_")
+    # insert underscore before capitals (camelCase/PascalCase)
+    s = re.sub(r'(?<!^)(?=[A-Z])', '_', s)
+    s = s.strip().replace(" ", "_").lower()
+    return s
 
 df.rename(columns=lambda c: to_snake(c), inplace=True)
 
-# exact table column order
+# Explicitly map variations to our schema names
+rename_map = {}
+if "gameid" in df.columns:
+    rename_map["gameid"] = "game_id"
+if "id" in df.columns:
+    rename_map["id"] = "game_id"  # some endpoints use 'id' for the game id
+df.rename(columns=rename_map, inplace=True)
+
+# Exact table column order
 COLS = [
     "game_id","season","season_type","week","team","opponent",
 
@@ -60,17 +71,21 @@ COLS = [
     "defense_passingplays_ppa","defense_passingplays_totalppa","defense_passingplays_successrate","defense_passingplays_explosiveness",
 ]
 
-# add any missing columns as empty strings so COPY aligns
+# Add any missing expected columns as empty strings so COPY aligns
 for c in COLS:
     if c not in df.columns:
         df[c] = ""
 
-# keep only + order
-df = df[COLS]
-# keep blanks as blanks (not "NaN")
-df = df.fillna("")
+# (Critical) Drop rows without a game_id to satisfy PK (game_id, team)
+missing_gid = df["game_id"].isna().sum()
+if missing_gid:
+    print(f"Warning: dropping {missing_gid} rows with null game_id (API sometimes omits for odd cases).")
+df = df[df["game_id"].notna()]
 
-# numeric columns for FORCE_NULL (empty string -> NULL)
+# Reorder and keep only expected columns
+df = df[COLS].fillna("")
+
+# Build FORCE_NULL: treat everything except these text columns as numeric
 TEXT_COLS = {"season_type","team","opponent"}
 NUMERIC_COLS = [c for c in COLS if c not in TEXT_COLS]
 
