@@ -78,7 +78,7 @@ def fetch_games() -> list[dict]:
 
         # Robust fallbacks for a few fields that have drifted names
         startdate = g2.get("start_date") or g2.get("start_time")
-        starttimetbd = g2.get("start_time_tbd")
+        starttimetbd = g2.get("start_time_tbd") or g2.get("StartTimeTBD") or g2.get("starttimetbd")
         homeclassification = g2.get("home_classification") or g2.get("home_division")
         awayclassification = g2.get("away_classification") or g2.get("away_division")
         home_pg_wp = (
