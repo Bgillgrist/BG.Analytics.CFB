@@ -76,17 +76,21 @@ def fetch_games() -> list[dict]:
         # map with robust fallbacks for fields CFBD sometimes renames
         startdate = first_of(g, "start_date", "start_time", "startDate", "startTime")
         # CFBD booleans occasionally vary in naming
-        starttimetbd = first_of(g, "start_time_tbd", "startTimeTbd")
+        starttimetbd = first_of(g, "start_time_tbd", "startTimeTbd", "StartTimeTBD")
+        attendance = first_of(g, "Attendance")
         neutralsite  = first_of(g, "neutral_site", "neutralSite")
         conferencegame = first_of(g, "conference_game", "conferenceGame")
+        homeclassification = first_of(g, "HomeClassification", "homeClassification")
+        awayclassification = first_of(g, "AwayClassification", "awayClassification")
         home_ls = join_linescores(first_of(g, "home_line_scores", "homeLineScores"))
         away_ls = join_linescores(first_of(g, "away_line_scores", "awayLineScores"))
         home_pg_wp = first_of(g,
                               "home_postgame_win_prob", "home_post_win_prob",
-                              "homePostgameWinProb", "homePostWinProb")
+                              "homePostgameWinProb", "HomePostgameWinProbability")
         away_pg_wp = first_of(g,
                               "away_postgame_win_prob", "away_post_win_prob",
-                              "awayPostgameWinProb", "awayPostWinProb")
+                              "awayPostgameWinProb", "AwayPostgameWinProbability")
+        highlights = first_of(g, "Highlights")
 
         row = {
             "id":                 first_of(g, "id", "game_id", "gameId"),
