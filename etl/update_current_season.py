@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, io, csv, datetime as dt
+import os, sys, io, csv, re, datetime as dt
 import psycopg, requests
 from dotenv import load_dotenv
 
@@ -48,13 +48,14 @@ FROM STDIN WITH (
 )
 """
 
-# ------- helpers -------
-def first_of(d: dict, *keys):
-    """Return first present, non-None value from d among keys."""
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
+# ---------- helpers ----------
+def to_snake(s: str) -> str:
+    # camelCase/PascalCase -> snake_case; also collapse spaces
+    s = re.sub(r"(?<!^)(?=[A-Z])", "_", s).replace(" ", "_")
+    return s.lower()
+
+def normalize_keys(d: dict) -> dict:
+    return {to_snake(k): v for k, v in d.items()}
 
 def join_linescores(xs):
     if not xs:
@@ -63,95 +64,102 @@ def join_linescores(xs):
         return ",".join(str(x) for x in xs)
     return str(xs)
 
-# ------- fetch -------
+# ---------- fetch ----------
 def fetch_games() -> list[dict]:
     print(f"Fetching all games for season {SEASON} ...")
-    r = requests.get(API_URL, params={"year": SEASON}, headers=API_HEADERS, timeout=90)
+    r = requests.get(API_URL, params={"year": SEASON}, headers=API_HEADERS, timeout=120)
     r.raise_for_status()
     data = r.json()
     print(f"Fetched {len(data)} total games.")
 
     rows = []
     for g in data:
-        # map with robust fallbacks for fields CFBD sometimes renames
-        startdate = first_of(g, "start_date", "start_time", "startDate", "startTime")
-        # CFBD booleans occasionally vary in naming
-        starttimetbd = first_of(g, "start_time_tbd", "startTimeTbd", "StartTimeTBD")
-        attendance = first_of(g, "Attendance")
-        neutralsite  = first_of(g, "neutral_site", "neutralSite")
-        conferencegame = first_of(g, "conference_game", "conferenceGame")
-        homeclassification = first_of(g, "HomeClassification", "homeClassification")
-        awayclassification = first_of(g, "AwayClassification", "awayClassification")
-        home_ls = join_linescores(first_of(g, "home_line_scores", "homeLineScores"))
-        away_ls = join_linescores(first_of(g, "away_line_scores", "awayLineScores"))
-        home_pg_wp = first_of(g,
-                              "home_postgame_win_prob", "home_post_win_prob",
-                              "homePostgameWinProb", "HomePostgameWinProbability")
-        away_pg_wp = first_of(g,
-                              "away_postgame_win_prob", "away_post_win_prob",
-                              "awayPostgameWinProb", "AwayPostgameWinProbability")
-        highlights = first_of(g, "Highlights")
+        g2 = normalize_keys(g)
+
+        # Robust fallbacks for a few fields that have drifted names
+        startdate = g2.get("start_date") or g2.get("start_time")
+        starttimetbd = g2.get("start_time_tbd")
+        homeclassification = g2.get("home_classification") or g2.get("home_division")
+        awayclassification = g2.get("away_classification") or g2.get("away_division")
+        home_pg_wp = (
+            g2.get("home_postgame_win_prob")
+            or g2.get("home_post_win_prob")
+            or g2.get("home_postgame_win_probability")
+        )
+        away_pg_wp = (
+            g2.get("away_postgame_win_prob")
+            or g2.get("away_post_win_prob")
+            or g2.get("away_postgame_win_probability")
+        )
 
         row = {
-            "id":                 first_of(g, "id", "game_id", "gameId"),
-            "season":             g.get("season"),
-            "week":               g.get("week"),
-            "seasontype":         first_of(g, "season_type", "seasonType"),
+            # core
+            "id":                 g2.get("id") or g2.get("game_id"),
+            "season":             g2.get("season"),
+            "week":               g2.get("week"),
+            "seasontype":         g2.get("season_type"),
             "startdate":          startdate,
             "starttimetbd":       starttimetbd,
-            "completed":          g.get("completed"),
-            "neutralsite":        neutralsite,
-            "conferencegame":     conferencegame,
-            "attendance":         g.get("attendance"),
-            "venueid":            first_of(g, "venue_id", "venueId"),
-            "venue":              g.get("venue"),
+            "completed":          g2.get("completed"),
+            "neutralsite":        g2.get("neutral_site"),
+            "conferencegame":     g2.get("conference_game"),
+            "attendance":         g2.get("attendance"),
+            "venueid":            g2.get("venue_id"),
+            "venue":              g2.get("venue"),
 
-            "homeid":             first_of(g, "home_id", "homeId"),
-            "hometeam":           first_of(g, "home_team", "homeTeam"),
-            "homeclassification": first_of(g, "home_division", "homeDivision"),
-            "homeconference":     first_of(g, "home_conference", "homeConference"),
-            "homepoints":         first_of(g, "home_points", "homePoints"),
-            "homelinescores":     home_ls,
+            # home
+            "homeid":             g2.get("home_id"),
+            "hometeam":           g2.get("home_team"),
+            "homeclassification": homeclassification,
+            "homeconference":     g2.get("home_conference"),
+            "homepoints":         g2.get("home_points"),
+            "homelinescores":     join_linescores(g2.get("home_line_scores")),
             "homepostgamewinprobability": home_pg_wp,
-            "homepregameelo":     first_of(g, "home_pregame_elo", "homePregameElo"),
-            "homepostgameelo":    first_of(g, "home_postgame_elo", "homePostgameElo"),
+            "homepregameelo":     g2.get("home_pregame_elo"),
+            "homepostgameelo":    g2.get("home_postgame_elo"),
 
-            "awayid":             first_of(g, "away_id", "awayId"),
-            "awayteam":           first_of(g, "away_team", "awayTeam"),
-            "awayclassification": first_of(g, "away_division", "awayDivision"),
-            "awayconference":     first_of(g, "away_conference", "awayConference"),
-            "awaypoints":         first_of(g, "away_points", "awayPoints"),
-            "awaylinescores":     away_ls,
+            # away
+            "awayid":             g2.get("away_id"),
+            "awayteam":           g2.get("away_team"),
+            "awayclassification": awayclassification,
+            "awayconference":     g2.get("away_conference"),
+            "awaypoints":         g2.get("away_points"),
+            "awaylinescores":     join_linescores(g2.get("away_line_scores")),
             "awaypostgamewinprobability": away_pg_wp,
-            "awaypregameelo":     first_of(g, "away_pregame_elo", "awayPregameElo"),
-            "awaypostgameelo":    first_of(g, "away_postgame_elo", "awayPostgameElo"),
+            "awaypregameelo":     g2.get("away_pregame_elo"),
+            "awaypostgameelo":    g2.get("away_postgame_elo"),
 
-            "excitementindex":    first_of(g, "excitement_index", "excitementIndex"),
-            "highlights":         g.get("highlights"),
-            "notes":              g.get("notes"),
+            # misc
+            "excitementindex":    g2.get("excitement_index"),
+            "highlights":         g2.get("highlights"),
+            "notes":              g2.get("notes"),
         }
         rows.append(row)
     return rows
 
+# ---------- csv ----------
 def to_csv_bytes(rows: list[dict]) -> bytes:
     sio = io.StringIO()
     w = csv.DictWriter(sio, fieldnames=COLS, extrasaction="ignore")
     w.writeheader()
     for r in rows:
-        # empty strings for NULLs lets COPY + FORCE_NULL coerce correctly
+        # empty string → NULL via COPY + FORCE_NULL
         w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in COLS})
     return sio.getvalue().encode("utf-8")
 
 def sanity_print(rows: list[dict]):
-    # quick visibility to catch schema drifts
     def nn(col): return sum(1 for r in rows if r.get(col) not in (None, ""))
     print("Non-null counts:",
           {c: nn(c) for c in [
-              "id","startdate","hometeam","awayteam",
+              "id","startdate","starttimetbd",
+              "hometeam","homeclassification",
+              "awayteam","awayclassification",
               "homepoints","awaypoints",
-              "homepregameelo","homepostgameelo","awaypregameelo","awaypostgameelo"
+              "homepregameelo","homepostgameelo",
+              "awaypregameelo","awaypostgameelo",
           ]})
 
+# ---------- main ----------
 def main():
     rows = fetch_games()
     sanity_print(rows)
