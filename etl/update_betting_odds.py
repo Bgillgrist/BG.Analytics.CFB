@@ -9,6 +9,12 @@ import requests
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Iterable, Optional
 
+def pick(d: dict, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 PG_DSN = os.getenv(
     "PG_DSN",
@@ -108,11 +114,11 @@ def fetch_lines_for_season(season: int) -> List[Dict[str, Any]]:
                 continue
             for game in data:
                 # Some fields may be absent in early weeks or incomplete records
-                game_id = game.get("id")
-                home = game.get("home_team")
-                away = game.get("away_team")
-                home_pts = game.get("home_points")
-                away_pts = game.get("away_points")
+                game_id  = pick(game, "id", "gameId")
+                home     = pick(game, "home_team", "homeTeam", "home")
+                away     = pick(game, "away_team", "awayTeam", "away")
+                home_pts = pick(game, "home_points", "homePoints", "home_score", "homeScore")
+                away_pts = pick(game, "away_points", "awayPoints", "away_score", "awayScore")
 
                 lines = game.get("lines") or []
                 if not lines:
