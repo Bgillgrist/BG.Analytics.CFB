@@ -46,3 +46,10 @@ jobs:
           # SEASON: "2025"   # optional override for backfills
         run: |
           python update_team_advanced_game_stats.py
+
+      - name: Update betting odds table
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+        run: |
+          python update_betting_odds.py
