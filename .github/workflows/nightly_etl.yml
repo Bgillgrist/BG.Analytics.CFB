@@ -56,6 +56,7 @@ jobs:
           python update_betting_odds.py
 
       - name: Update daily team ratings
+        working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
         run: python "update_team_ratings.py"
