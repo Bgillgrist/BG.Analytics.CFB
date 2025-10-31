@@ -58,4 +58,4 @@ jobs:
       - name: Update daily team ratings
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
-        run: python "Rating Updates/backfill_history.py"
+        run: python "update_team_ratings.py"
