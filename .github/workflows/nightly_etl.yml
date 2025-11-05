@@ -55,8 +55,8 @@ jobs:
         run: |
           python update_betting_odds.py
 
-      - name: Update daily team ratings
+      - name: Update market_v1 and performance_v1
         working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
-        run: python "update_team_ratings.py"
+        run: python "update_team_ratings_mv1_pv1.py"
