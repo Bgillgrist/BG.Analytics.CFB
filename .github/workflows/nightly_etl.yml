@@ -59,10 +59,12 @@ jobs:
         working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
+          ASOF_DATE: "2025-11-04"
         run: python "update_team_ratings_mv1_pv1.py"
 
       - name: Update market_v2 and bg_v1
         working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
+          ASOF_DATE: "2025-11-04"
         run: python "update_team_ratings_bgv1_mv2.py"
