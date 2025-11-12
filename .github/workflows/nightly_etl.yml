@@ -66,3 +66,9 @@ jobs:
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
         run: python "update_team_ratings_bgv1_mv2.py"
+
+      - name: Update performance v2
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+        run: python "update_team_ratings_pv2.py"
