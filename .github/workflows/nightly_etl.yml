@@ -72,3 +72,12 @@ jobs:
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
         run: python "update_team_ratings_pv2.py"
+
+      - name: Update game predictions
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          MODEL_VERSION: "predictions_v1"
+          RATING_LAG_DAYS: "1"
+        run: |
+          python "update_game_predictions.py"
