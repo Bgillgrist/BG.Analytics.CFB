@@ -47,6 +47,14 @@ jobs:
         run: |
           python update_team_advanced_game_stats.py
 
+      - name: Update rankings
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+        run: |
+          python update_rankings.py
+
       - name: Update betting odds table (CFBD)
         working-directory: etl
         env:
