@@ -18,7 +18,7 @@ Table schema expected:
       conference        text,
       first_place_votes int,
       points            int,
-      PRIMARY KEY (season, week, poll, rank)
+      PRIMARY KEY (season, week, poll, rank, school)
   );
 """
 
