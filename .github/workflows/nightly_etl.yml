@@ -64,13 +64,14 @@ jobs:
           python update_betting_odds.py
 
       - name: Add ratings for today only
+        working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           # START_SEASON: 2025
           # END_SEASON: 2025
           ASOF_MIN: ${{ steps.today.outputs.date }}
           ASOF_MAX: ${{ steps.today.outputs.date }}
-        run: python "Rating Updates/backfill_history.py"
+        run: python update_team_ratings.py
 
       - name: Update game predictions
         working-directory: etl
