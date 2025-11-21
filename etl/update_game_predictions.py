@@ -4,11 +4,14 @@ nightly_predictions.py
 
 Purpose:
   - Train a win probability model and a spread model using the SAME covariates:
-      * all 5 ratings (team & opponent, including performance_v2)
-      * week
-      * week × all 10 rating interactions
-      * missing flags for each rating
-      * location, teamclassification, opponentclassification
+      * 4 rating models available (market_v1, performance_v1, bg_v1, market_v2)
+      * Base features use ONLY 3 models for each side:
+          - team/opp: performance_v1, bg_v1, market_v2  (6 numeric features)
+      * market_v1 (team & opp) is used ONLY through week interactions:
+          - team_market_rating_week, opp_market_rating_week
+      * So: 6 base rating features + 8 interaction features total
+      * plus missing flags for the 6 base ratings
+      * plus week, location, teamclassification, opponentclassification
   - Train on seasons 2015..(current_season - 1)
   - Predict for ALL games in the current season
   - Store one row per game (home perspective) in public.game_predictions
@@ -62,7 +65,9 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
     Build a team-centric modeling table:
       - seasons 2015..max_season
       - one row per team per game
-      - joins 5 ratings for team & opponent (including performance_v2)
+      - joins 4 rating models for team & opponent:
+          market_v1, performance_v1, bg_v1, market_v2
+      - but market_v1 is only used later via week interactions
       - builds an 'asof_target' = gamedate - RATING_LAG_DAYS for rating lookups
     """
 
@@ -144,24 +149,25 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
         rating_value
       FROM public.team_ratings
       WHERE rating_model IN (
-        'market_v1', 'performance_v1', 'bg_v1',
-        'market_v2', 'performance_v2'
+        'market_v1', 'performance_v1', 'bg_v1', 'market_v2'
       )
     ),
     joined AS (
       SELECT
         tr.*,
+
+        -- TEAM ratings
         tm_m1.rating_value  AS team_market_rating,
         tm_p1.rating_value  AS team_perf_rating,
         tm_bg.rating_value  AS team_bg_rating,
         tm_m2.rating_value  AS team_market_v2_rating,
-        tm_p2.rating_value  AS team_perf_v2_rating,
 
+        -- OPPONENT ratings
         op_m1.rating_value  AS opp_market_rating,
         op_p1.rating_value  AS opp_perf_rating,
         op_bg.rating_value  AS opp_bg_rating,
-        op_m2.rating_value  AS opp_market_v2_rating,
-        op_p2.rating_value  AS opp_perf_v2_rating
+        op_m2.rating_value  AS opp_market_v2_rating
+
       FROM team_rows tr
 
       -- TEAM side
@@ -170,26 +176,24 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
        AND tm_m1.rating_model = 'market_v1'
        AND tr.asof_target >= tm_m1.asof_date
        AND (tr.asof_target < tm_m1.next_asof_date OR tm_m1.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans tm_p1
         ON tm_p1.team = tr.team
        AND tm_p1.rating_model = 'performance_v1'
        AND tr.asof_target >= tm_p1.asof_date
        AND (tr.asof_target < tm_p1.next_asof_date OR tm_p1.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans tm_bg
         ON tm_bg.team = tr.team
        AND tm_bg.rating_model = 'bg_v1'
        AND tr.asof_target >= tm_bg.asof_date
        AND (tr.asof_target < tm_bg.next_asof_date OR tm_bg.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans tm_m2
         ON tm_m2.team = tr.team
        AND tm_m2.rating_model = 'market_v2'
        AND tr.asof_target >= tm_m2.asof_date
        AND (tr.asof_target < tm_m2.next_asof_date OR tm_m2.next_asof_date IS NULL)
-      LEFT JOIN rating_spans tm_p2
-        ON tm_p2.team = tr.team
-       AND tm_p2.rating_model = 'performance_v2'
-       AND tr.asof_target >= tm_p2.asof_date
-       AND (tr.asof_target < tm_p2.next_asof_date OR tm_p2.next_asof_date IS NULL)
 
       -- OPPONENT side
       LEFT JOIN rating_spans op_m1
@@ -197,26 +201,24 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
        AND op_m1.rating_model = 'market_v1'
        AND tr.asof_target >= op_m1.asof_date
        AND (tr.asof_target < op_m1.next_asof_date OR op_m1.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans op_p1
         ON op_p1.team = tr.opponent
        AND op_p1.rating_model = 'performance_v1'
        AND tr.asof_target >= op_p1.asof_date
        AND (tr.asof_target < op_p1.next_asof_date OR op_p1.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans op_bg
         ON op_bg.team = tr.opponent
        AND op_bg.rating_model = 'bg_v1'
        AND tr.asof_target >= op_bg.asof_date
        AND (tr.asof_target < op_bg.next_asof_date OR op_bg.next_asof_date IS NULL)
+
       LEFT JOIN rating_spans op_m2
         ON op_m2.team = tr.opponent
        AND op_m2.rating_model = 'market_v2'
        AND tr.asof_target >= op_m2.asof_date
        AND (tr.asof_target < op_m2.next_asof_date OR op_m2.next_asof_date IS NULL)
-      LEFT JOIN rating_spans op_p2
-        ON op_p2.team = tr.opponent
-       AND op_p2.rating_model = 'performance_v2'
-       AND tr.asof_target >= op_p2.asof_date
-       AND (tr.asof_target < op_p2.next_asof_date OR op_p2.next_asof_date IS NULL)
     )
     SELECT *
     FROM joined
@@ -234,12 +236,16 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
 # ─────────────────────────────
 def train_models(df: pd.DataFrame, current_season: int):
     """
-    Uses the requested covariates:
-      * 5 ratings for team & opponent (10 total), including performance_v2
-      * missing flags for each rating
-      * week
-      * week × each of the 10 ratings
-      * location, teamclassification, opponentclassification
+    Covariates:
+      - Base rating features (6):
+          team_perf_rating, team_bg_rating, team_market_v2_rating,
+          opp_perf_rating,  opp_bg_rating,  opp_market_v2_rating
+      - Missing flags for those 6 ratings.
+      - Week (numeric).
+      - Week interactions for 8 ratings:
+          * the 6 above
+          * team_market_rating, opp_market_rating (market_v1, interaction-only)
+      - Categorical: location, teamclassification, opponentclassification
 
     Trains:
       - win_model   (LogisticRegression, target = team_win)
@@ -248,15 +254,17 @@ def train_models(df: pd.DataFrame, current_season: int):
 
     df = df.copy()
 
-    # Base rating columns (10)
+    # Base rating columns: 3 models × (team, opp) = 6 features
     rating_cols = [
-        "team_market_rating", "team_perf_rating", "team_bg_rating",
-        "team_market_v2_rating", "team_perf_v2_rating",
-        "opp_market_rating",  "opp_perf_rating",  "opp_bg_rating",
-        "opp_market_v2_rating", "opp_perf_v2_rating",
+        "team_perf_rating",
+        "team_bg_rating",
+        "team_market_v2_rating",
+        "opp_perf_rating",
+        "opp_bg_rating",
+        "opp_market_v2_rating",
     ]
 
-    # Missing flags + fill missing ratings with 0 (mean-ish, ratings are centered)
+    # Missing flags for these 6 ratings + fillna(0) (ratings are mean-zero-ish)
     rating_missing_cols = []
     for col in rating_cols:
         miss_col = f"{col}_missing"
@@ -264,12 +272,26 @@ def train_models(df: pd.DataFrame, current_season: int):
         df[miss_col] = df[col].isna().astype(int)
         df[col] = df[col].fillna(0.0)
 
+    # market_v1 ratings used only via interactions:
+    # - team_market_rating, opp_market_rating
+    # make sure they exist and are filled
+    for col in ["team_market_rating", "opp_market_rating"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        else:
+            df[col] = df[col].fillna(0.0)
+
     # Week numeric
     df["week"] = df["week"].astype(float)
 
-    # Interaction: week * each of the 10 ratings
+    # Interaction base columns:
+    #   - 6 base rating features
+    #   - plus team/opp market_v1 (interaction-only)
+    interaction_base_cols = rating_cols + ["team_market_rating", "opp_market_rating"]
+
+    # Create week interactions for these 8
     interaction_cols = []
-    for col in rating_cols:
+    for col in interaction_base_cols:
         inter_col = f"{col}_week"
         interaction_cols.append(inter_col)
         df[inter_col] = df[col] * df["week"]
@@ -285,7 +307,7 @@ def train_models(df: pd.DataFrame, current_season: int):
     # Features used for BOTH models
     numeric_features = rating_cols + rating_missing_cols + ["week"] + interaction_cols
 
-    # Training sets
+    # Training sets: seasons before current_season
     train_mask = (df["season"] < current_season) & df["team_win"].notna()
     train_win = df[train_mask].copy()
 
@@ -297,7 +319,7 @@ def train_models(df: pd.DataFrame, current_season: int):
     if train_spread.empty:
         raise RuntimeError("No training data for spread model (spread missing).")
 
-    # Define common preprocessing
+    # Common preprocessing
     numeric_transformer = StandardScaler()
     categorical_transformer = OneHotEncoder(drop="first", handle_unknown="ignore")
 
@@ -440,7 +462,7 @@ def main():
             tmp["total_points"] = tmp["teampoints"] + tmp["opponentpoints"]
             avg_total = float(tmp["total_points"].mean())
         else:
-            avg_total = None  # or fallback to historical global mean
+            avg_total = None
         print(f"Average total for season {current_season}: {avg_total}")
 
         # Prepare current-season rows for prediction
