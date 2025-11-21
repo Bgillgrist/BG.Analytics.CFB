@@ -595,9 +595,27 @@ def main() -> None:
         return
 
     # Bound by env vars if provided
-    start_season = int(os.getenv("START_SEASON", all_bounds["season"].min()))
-    end_season   = int(os.getenv("END_SEASON",   all_bounds["season"].max()))
-    bounds = all_bounds[(all_bounds["season"] >= start_season) & (all_bounds["season"] <= end_season)]
+    # Bound by env vars if provided; otherwise, default to *current* CFB season
+    start_env = os.getenv("START_SEASON")
+    end_env   = os.getenv("END_SEASON")
+
+    if start_env or end_env:
+        # Manual override (useful for big backfills)
+        start_season = int(start_env or all_bounds["season"].min())
+        end_season   = int(end_env   or start_season)
+    else:
+        # Automatic nightly behavior: just do the current CFB season
+        auto_season = current_cfb_season()
+        # Clamp to known seasons in game_data
+        min_season = int(all_bounds["season"].min())
+        max_season = int(all_bounds["season"].max())
+        auto_season = max(min_season, min(max_season, auto_season))
+        start_season = end_season = auto_season
+
+    bounds = all_bounds[
+        (all_bounds["season"] >= start_season) &
+        (all_bounds["season"] <= end_season)
+    ]
 
     print(f"Backfilling seasons {start_season}..{end_season} ({len(bounds)} seasons)")
 
