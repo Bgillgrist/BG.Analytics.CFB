@@ -63,23 +63,14 @@ jobs:
         run: |
           python update_betting_odds.py
 
-      - name: Update market_v1 and performance_v1
-        working-directory: etl
+      - name: Add ratings for today only
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
-        run: python "update_team_ratings_mv1_pv1.py"
-
-      - name: Update market_v2 and bg_v1
-        working-directory: etl
-        env:
-          PG_DSN: ${{ secrets.PG_DSN }}
-        run: python "update_team_ratings_bgv1_mv2.py"
-
-      - name: Update performance v2
-        working-directory: etl
-        env:
-          PG_DSN: ${{ secrets.PG_DSN }}
-        run: python "update_team_ratings_pv2.py"
+          # START_SEASON: 2025
+          # END_SEASON: 2025
+          ASOF_MIN: ${{ steps.today.outputs.date }}
+          ASOF_MAX: ${{ steps.today.outputs.date }}
+        run: python "Rating Updates/backfill_history.py"
 
       - name: Update game predictions
         working-directory: etl
