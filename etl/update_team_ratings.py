@@ -38,6 +38,17 @@ ASOF_MAX = _parse_date_or_none(ASOF_MAX_STR) or date.today()
 # Utility SQL helpers
 # ────────────────────────────────────────────
 
+def current_cfb_season(today: Optional[date] = None) -> int:
+    """
+    Return the current CFB season based on calendar date.
+    Rule of thumb:
+      - Jan–Jul: belong to previous season
+      - Aug–Dec: belong to current calendar year
+    """
+    if today is None:
+        today = date.today()
+    return today.year if today.month >= 8 else today.year - 1
+
 def fetch_season_bounds() -> pd.DataFrame:
     """Return one row per season with first/last game dates."""
     sql = f"""
