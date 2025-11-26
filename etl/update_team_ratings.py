@@ -170,6 +170,7 @@ def compute_market_v1_ratings(
         FROM {GAME_TABLE}
         WHERE season = %s
           AND startdate::date > %s
+          AND seasontype = 'regular'
           AND homeclassification IN ('fbs','fcs')
           AND awayclassification IN ('fbs','fcs')
         ORDER BY week
@@ -178,9 +179,7 @@ def compute_market_v1_ratings(
     future_weeks_df = pd.read_sql(future_weeks_sql, conn, params=(season, asof_date))
     future_weeks = future_weeks_df["week"].tolist()
 
-    # Query betting lines for past and selected future games
-    # Use b."Spread" for past games (startdate <= asof_date)
-    # Use COALESCE(b."OpeningSpread", b."Spread") for future games in future_weeks
+    # Query betting lines for past and selected future regular-season games only
     sql = f"""
         SELECT
             g.id,
@@ -190,7 +189,10 @@ def compute_market_v1_ratings(
             AVG(
                 CASE
                     WHEN g.startdate::date <= %s THEN b."Spread"
-                    WHEN g.week = ANY(%s) THEN COALESCE(b."OpeningSpread", b."Spread")
+                    WHEN g.startdate::date > %s
+                         AND g.week = ANY(%s)
+                         AND g.seasontype = 'regular'
+                    THEN COALESCE(b."OpeningSpread", b."Spread")
                     ELSE NULL
                 END
             ) AS home_spread
@@ -202,11 +204,18 @@ def compute_market_v1_ratings(
           AND (
             (g.startdate::date <= %s AND b."Spread" IS NOT NULL)
             OR
-            (g.week = ANY(%s) AND (b."OpeningSpread" IS NOT NULL OR b."Spread" IS NOT NULL))
+            (g.startdate::date > %s
+             AND g.week = ANY(%s)
+             AND g.seasontype = 'regular'
+             AND (b."OpeningSpread" IS NOT NULL OR b."Spread" IS NOT NULL))
           )
         GROUP BY g.id, g.hometeam, g.awayteam, g.neutralsite
     """
-    df = pd.read_sql(sql, conn, params=(asof_date, future_weeks, season, asof_date, future_weeks))
+    df = pd.read_sql(
+        sql,
+        conn,
+        params=(asof_date, asof_date, future_weeks, season, asof_date, asof_date, future_weeks),
+    )
 
     if df.empty:
         return pd.DataFrame(columns=["team", "rating"])
@@ -381,11 +390,14 @@ def compute_bg_v1_ratings(
           AND g.awayclassification IN ('fbs','fcs')
           AND (
                 g.startdate::date <= %s
-             OR (g.week = ANY(%s) AND g.startdate::date > %s)
+          AND seasontype = 'regular'
           )
           AND (
                 (g.startdate::date <= %s AND b."Spread" IS NOT NULL)
-             OR (g.week = ANY(%s) AND b."Spread" IS NOT NULL)
+             OR (g.week = ANY(%s)
+                 AND g.startdate::date > %s
+                 AND g.seasontype = 'regular'
+                 AND b."Spread" IS NOT NULL)
           )
         GROUP BY
             g.id,
@@ -404,6 +416,7 @@ def compute_bg_v1_ratings(
         asof_date,
         asof_date,
         future_weeks,
+        asof_date,
     )
     df = pd.read_sql(sql, conn, params=params)
 
