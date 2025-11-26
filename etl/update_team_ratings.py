@@ -353,12 +353,13 @@ def compute_bg_v1_ratings(
       - 'rating'
     """
 
-    # 1) Determine future weeks after asof_date (limited by FUTURE_WEEKS_AHEAD)
+    # 1) Determine future regular-season weeks after asof_date (limited by FUTURE_WEEKS_AHEAD)
     future_weeks_sql = f"""
         SELECT DISTINCT week
         FROM {GAME_TABLE}
         WHERE season = %s
           AND startdate::date > %s
+          AND seasontype = 'regular'
           AND homeclassification IN ('fbs','fcs')
           AND awayclassification IN ('fbs','fcs')
         ORDER BY week
@@ -390,7 +391,9 @@ def compute_bg_v1_ratings(
           AND g.awayclassification IN ('fbs','fcs')
           AND (
                 g.startdate::date <= %s
-          AND seasontype = 'regular'
+             OR (g.week = ANY(%s)
+                 AND g.startdate::date > %s
+                 AND g.seasontype = 'regular')
           )
           AND (
                 (g.startdate::date <= %s AND b."Spread" IS NOT NULL)
