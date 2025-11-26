@@ -11,7 +11,7 @@ from typing import Iterable, Tuple, Optional
 # ────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────
-PG_DSN = "postgresql://neondb_owner:npg_Up1blnYS0oxs@ep-delicate-brook-a4yhfswb-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+PG_DSN = os.getenv("PG_DSN")
 HFA = 2.5
 MOV_CAP = 28
 RIDGE = 1e-6
