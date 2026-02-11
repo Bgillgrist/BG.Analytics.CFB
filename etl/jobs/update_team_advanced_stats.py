@@ -133,7 +133,7 @@ def _fetch_stats(season: int, api_key: Optional[str], logger) -> pd.DataFrame:
     if not isinstance(data, list):
         raise RuntimeError(f"Unexpected CFBD response type for advanced season stats: {type(data)}")
 
-    df = pd.json_normalize(data)
+    df = pd.json_normalize(data, sep="_")
     logger.info(f"Retrieved {len(df)} rows from CFBD.")
     return df
 
