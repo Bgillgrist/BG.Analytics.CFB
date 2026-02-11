@@ -1,0 +1,28 @@
+# --- Environment Variables ---
+.env
+etl/.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# --- Virtual Environments ---
+venv/
+.venv/
+env/
+
+# --- macOS ---
+.DS_Store
+
+# --- VSCode ---
+.vscode/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Temporary files ---
+*.tmp
+*.bak
