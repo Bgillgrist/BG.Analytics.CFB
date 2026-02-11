@@ -77,7 +77,7 @@ def _validate_df(df: pd.DataFrame, allow_empty: bool) -> None:
             raise ValueError(f"Missing required column after normalization: {c}")
 
     # Duplicate check on natural key / table PK
-    dupes = df.duplicated(subset=["season", "week", "poll", "rank", "school"]).sum()
+    dupes = df.duplicated(subset=["season", "season_type", "week", "poll", "rank", "school"]).sum()
     if dupes:
         raise ValueError(f"Found {dupes} duplicate rows on key (season, week, poll, rank, school); aborting.")
 
