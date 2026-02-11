@@ -127,6 +127,20 @@ def _rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
 # -------------------------
 # Fetch + Transform
 # -------------------------
+
+def _normalize_provider(p: Optional[str]) -> Optional[str]:
+    if p is None:
+        return None
+    p2 = " ".join(p.strip().split())  # trims + collapses double spaces
+    mapping = {
+        "Draft Kings": "DraftKings",
+        "Caesars Sportsbook (Colorado)": "Caesars",
+        "Caesars (Pennsylvania)": "Caesars",
+        "William Hill (New Jersey)": "William Hill",
+    }
+    return mapping.get(p2, p2)
+
+
 def _fetch_lines_for_season(season: int, api_key: Optional[str], logger) -> List[Dict[str, Any]]:
     session = build_retry_session(api_key=api_key, timeout_seconds=60, total_retries=6)
 
@@ -186,7 +200,7 @@ def _fetch_lines_for_season(season: int, api_key: Optional[str], logger) -> List
                             "AwayTeam": away,
                             "AwayScore": away_pts,
                             "FormattedSpread": ln.get("formattedSpread"),
-                            "LineProvider": ln.get("provider"),
+                            "LineProvider": _normalize_provider(ln.get("provider")),
                             "OverUnder": ln.get("overUnder"),
                             "Spread": ln.get("spread"),
                             "OpeningSpread": ln.get("spreadOpen"),
