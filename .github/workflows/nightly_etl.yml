@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "15 7 * * *"
   workflow_dispatch:
+    inputs:
+      season:
+        description: "Optional season override (for example 2025). Leave blank to use the default inferred season."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   update-current-season:
@@ -25,30 +31,35 @@ jobs:
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.update_current_season
 
       - name: Update team advanced season stats
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.update_team_advanced_stats
 
       - name: Update team advanced game stats
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.update_team_advanced_game_stats
 
       - name: Update rankings
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.update_rankings
 
       - name: Update betting odds table
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.update_betting_odds
 
 #      - name: Add ratings for today only
@@ -62,10 +73,7 @@ jobs:
 #        run: python update_team_ratings.py
 
       - name: Update game predictions
-        working-directory: etl
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
-          MODEL_VERSION: "predictions_v1"
-          RATING_LAG_DAYS: "1"
-        run: |
-          python "update_game_predictions.py"
+          SEASON: ${{ github.event.inputs.season }}
+        run: python -m etl.jobs.update_game_predictions

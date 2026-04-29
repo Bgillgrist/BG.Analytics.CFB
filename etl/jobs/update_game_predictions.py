@@ -19,7 +19,6 @@ Purpose:
 
 Config via environment:
   - PG_DSN         : Postgres connection string
-  - RATING_LAG_DAYS: how many days prior to gameday ratings must be as-of (default 1)
   - MODEL_VERSION  : a tag for this model version (default 'wp_spread_v1')
 """
 
@@ -485,8 +484,8 @@ def main():
     cfg = load_config()
     print("Connecting to database...")
     with psycopg.connect(cfg.pg_dsn) as conn:
-        current_season = get_current_season(conn)
-        print(f"Current season detected: {current_season}")
+        current_season = cfg.season
+        print(f"Target season: {current_season}")
 
         print("Building modeling table...")
         df = build_modeling_table(conn, max_season=current_season)
