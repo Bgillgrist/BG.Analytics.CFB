@@ -61,11 +61,11 @@ jobs:
 #          ASOF_MAX: ${{ steps.today.outputs.date }}
 #        run: python update_team_ratings.py
 
-#      - name: Update game predictions
-#        working-directory: etl
-#        env:
-#          PG_DSN: ${{ secrets.PG_DSN }}
-#          MODEL_VERSION: "predictions_v1"
-#          RATING_LAG_DAYS: "1"
-#        run: |
-#          python "update_game_predictions.py"
+      - name: Update game predictions
+        working-directory: etl
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          MODEL_VERSION: "predictions_v1"
+          RATING_LAG_DAYS: "1"
+        run: |
+          python "update_game_predictions.py"
