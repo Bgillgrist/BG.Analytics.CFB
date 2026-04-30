@@ -515,7 +515,7 @@ def main():
             current_df.loc[spread_line_mask, "homewinprob"] = model_bundle["win_line"].predict_proba(
                 current_df.loc[spread_line_mask, spread_win_line_features]
             )[:, 1]
-            current_df.loc[spread_line_mask, "homespread"] = model_bundle["spread_line"].predict(
+            current_df.loc[spread_line_mask, "homespread"] = -model_bundle["spread_line"].predict(
                 current_df.loc[spread_line_mask, spread_win_line_features]
             )
 
@@ -523,7 +523,7 @@ def main():
             current_df.loc[~spread_line_mask, "homewinprob"] = model_bundle["win_fallback"].predict_proba(
                 current_df.loc[~spread_line_mask, spread_win_fallback_features]
             )[:, 1]
-            current_df.loc[~spread_line_mask, "homespread"] = model_bundle["spread_fallback"].predict(
+            current_df.loc[~spread_line_mask, "homespread"] = -model_bundle["spread_fallback"].predict(
                 current_df.loc[~spread_line_mask, spread_win_fallback_features]
             )
 
