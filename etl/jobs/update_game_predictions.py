@@ -1,61 +1,125 @@
 #!/usr/bin/env python3
 """
-nightly_predictions.py
-
-Purpose:
-  - Train a win probability model and a spread model using the SAME covariates:
-      * 4 rating models available (market_v1, performance_v1, bg_v1, market_v2)
-      * Base features use ONLY 3 models for each side:
-          - team/opp: performance_v1, bg_v1, market_v2  (6 numeric features)
-      * market_v1 (team & opp) is used ONLY through week interactions:
-          - team_market_rating_week, opp_market_rating_week
-      * So: 6 base rating features + 8 interaction features total
-      * plus missing flags for the 6 base ratings
-      * plus week, location, teamclassification, opponentclassification
-  - Train on seasons 2015..(current_season - 1)
-  - Predict for ALL games in the current season
-  - Store one row per game (home perspective) in public.game_predictions
-  - Set totalpred = average total points of completed games in the current season.
-
-Config via environment:
-  - PG_DSN         : Postgres connection string
-  - MODEL_VERSION  : a tag for this model version (default 'wp_spread_v1')
+Train game prediction models from Neon data and update public.game_predictions.
 """
 
+from __future__ import annotations
+
+import os
 import sys
-import psycopg
-import pandas as pd
+
+# Keep model runs single-threaded to avoid OpenMP SHM issues in small runners.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
+import pandas as pd
+import psycopg
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from etl.common_config import load_config
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression, LinearRegression
+
 
 MODEL_VERSION = "preds_2026"
+ADVANCED_GAME_KEY_COLS = ["game_id", "season", "season_type", "week", "team", "opponent"]
 
-# ─────────────────────────────
-# Helpers: DB + current season
-# ─────────────────────────────
-def get_current_season(conn) -> int:
-    with conn.cursor() as cur:
-        cur.execute("SELECT MAX(season) FROM public.game_data;")
-        row = cur.fetchone()
-        if not row or row[0] is None:
-            raise RuntimeError("Could not determine current season from game_data.")
-        return int(row[0])
+BASE_DIFF_FEATURES = [
+    "recruiting_diff",
+    "talent_diff",
+    "returning_diff",
+    "offense_ppa_prior_avg_diff",
+    "offense_totalppa_prior_avg_diff",
+    "offense_successrate_prior_avg_diff",
+    "offense_explosiveness_prior_avg_diff",
+    "defense_ppa_prior_avg_diff",
+    "defense_totalppa_prior_avg_diff",
+    "defense_successrate_prior_avg_diff",
+    "defense_explosiveness_prior_avg_diff",
+]
+
+MODEL_2_EXTRA_DIFF_FEATURES = [
+    "offense_stuffrate_prior_avg_diff",
+    "offense_openfieldyardstotal_prior_avg_diff",
+    "offense_standarddowns_ppa_prior_avg_diff",
+    "offense_standarddowns_successrate_prior_avg_diff",
+    "offense_passingdowns_ppa_prior_avg_diff",
+    "offense_passingdowns_successrate_prior_avg_diff",
+    "offense_rushingplays_totalppa_prior_avg_diff",
+    "offense_rushingplays_successrate_prior_avg_diff",
+    "offense_rushingplays_explosiveness_prior_avg_diff",
+    "offense_passingplays_totalppa_prior_avg_diff",
+    "offense_passingplays_explosiveness_prior_avg_diff",
+    "defense_plays_prior_avg_diff",
+    "defense_drives_prior_avg_diff",
+    "defense_powersuccess_prior_avg_diff",
+    "defense_secondlevelyardstotal_prior_avg_diff",
+    "defense_standarddowns_ppa_prior_avg_diff",
+    "defense_passingdowns_successrate_prior_avg_diff",
+    "defense_passingdowns_explosiveness_prior_avg_diff",
+    "defense_rushingplays_ppa_prior_avg_diff",
+    "defense_passingplays_totalppa_prior_avg_diff",
+    "defense_passingplays_explosiveness_prior_avg_diff",
+]
+
+ADVANCED_DIFF_FEATURES = [
+    col
+    for col in BASE_DIFF_FEATURES + MODEL_2_EXTRA_DIFF_FEATURES
+    if col.endswith("_prior_avg_diff")
+]
+ADVANCED_METRICS = [
+    col.replace("_prior_avg_diff", "")
+    for col in ADVANCED_DIFF_FEATURES
+]
+
+PRESEASON_VALUE_COLS = {
+    "recruiting": ("away_recruiting_points", "home_recruiting_points"),
+    "talent": ("away_talent", "home_talent"),
+    "returning": (
+        "away_returning_production_total_ppa",
+        "home_returning_production_total_ppa",
+    ),
+}
+
+PRESEASON_IMPUTER_FEATURES = [
+    "away_recruiting_points",
+    "away_talent",
+    "away_returning_production_total_ppa",
+    "home_recruiting_points",
+    "home_talent",
+    "home_returning_production_total_ppa",
+]
+
+LINE_AWARE_IMPUTER_FEATURES = PRESEASON_IMPUTER_FEATURES + ["avg_spread", "avg_over_under"]
+MIN_AUXILIARY_TRAINING_ROWS = 10
 
 
-# ─────────────────────────────
-# Build modeling table
-# ─────────────────────────────
 def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
-    """
-    Build a team-centric modeling table:
-      - seasons 2015..max_season
-      - one row per team per game
-    """
+    prior_select_sql = ",\n        ".join(
+        f"""
+        AVG(t.{metric}) OVER (
+          PARTITION BY t.season, t.team
+          ORDER BY t.phase_order, t.gamedate, t.game_id
+          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS {metric}_prior_avg""".strip()
+        for metric in ADVANCED_METRICS
+    )
+    advanced_base_cols_sql = ",\n          ".join(f"tags.{metric}" for metric in ADVANCED_METRICS)
+    away_prior_select_sql = ",\n      ".join(
+        f"aasp.{metric}_prior_avg AS away_{metric}_prior_avg,\n"
+        f"      hasp.{metric}_prior_avg AS home_{metric}_prior_avg"
+        for metric in ADVANCED_METRICS
+    )
+    away_actual_select_sql = ",\n      ".join(
+        f"aactual.{metric} AS away_{metric}_actual,\n"
+        f"      hactual.{metric} AS home_{metric}_actual"
+        for metric in ADVANCED_METRICS
+    )
 
     sql = f"""
     WITH g AS (
@@ -77,119 +141,76 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
         AND awayclassification = 'fbs'
         AND startdate IS NOT NULL
     ),
+    fbs_team_seasons AS (
+      SELECT hometeam AS team, season
+      FROM public.game_data
+      WHERE homeclassification = 'fbs'
+        AND hometeam IS NOT NULL
+      UNION
+      SELECT awayteam AS team, season
+      FROM public.game_data
+      WHERE awayclassification = 'fbs'
+        AND awayteam IS NOT NULL
+    ),
+    first_fbs_seasons AS (
+      SELECT team, MIN(season) AS first_fbs_season
+      FROM fbs_team_seasons
+      GROUP BY team
+    ),
     odds AS (
       SELECT
         CAST("Id" AS BIGINT) AS id,
         AVG("Spread") AS avg_spread,
-        AVG("OpeningSpread") AS avg_opening_spread,
-        AVG("OverUnder") AS avg_over_under,
-        AVG("OpeningOverUnder") AS avg_opening_over_under
+        AVG("OverUnder") AS avg_over_under
       FROM public.betting_odds
       GROUP BY 1
+    ),
+    advanced_base AS (
+      SELECT
+        tags.game_id,
+        tags.season,
+        tags.team,
+        CAST(gd_adv.startdate AS date) AS gamedate,
+        CASE
+          WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'regular' THEN 1
+          WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'postseason' THEN 2
+          ELSE 3
+        END AS phase_order,
+        {advanced_base_cols_sql}
+      FROM public.team_advanced_game_stats tags
+      INNER JOIN public.game_data gd_adv
+        ON gd_adv.id = tags.game_id
+      WHERE tags.season BETWEEN 2015 AND %s
+        AND gd_adv.startdate IS NOT NULL
     ),
     advanced_stats_prior AS (
       SELECT
         t.game_id,
         t.team,
-        AVG(t.offense_totalppa) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS offense_totalppa_prior_avg,
-        AVG(t.offense_successrate) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS offense_successrate_prior_avg,
-        AVG(t.offense_explosiveness) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS offense_explosiveness_prior_avg,
-        AVG(t.defense_totalppa) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS defense_totalppa_prior_avg,
-        AVG(t.defense_successrate) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS defense_successrate_prior_avg,
-        AVG(t.defense_explosiveness) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY
-            t.phase_order,
-            t.gamedate,
-            t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS defense_explosiveness_prior_avg
-      FROM (
-        SELECT
-          tags.game_id,
-          tags.season,
-          tags.team,
-          CAST(gd_adv.startdate AS date) AS gamedate,
-          CASE
-            WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'regular' THEN 1
-            WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'postseason' THEN 2
-            ELSE 3
-          END AS phase_order,
-          tags.offense_totalppa,
-          tags.offense_successrate,
-          tags.offense_explosiveness,
-          tags.defense_totalppa,
-          tags.defense_successrate,
-          tags.defense_explosiveness
-        FROM public.team_advanced_game_stats tags
-        INNER JOIN public.game_data gd_adv
-          ON gd_adv.id = tags.game_id
-        WHERE tags.season BETWEEN 2015 AND %s
-          AND gd_adv.startdate IS NOT NULL
-      ) t
+        {prior_select_sql}
+      FROM advanced_base t
     )
     SELECT
       g.*,
       o.avg_spread,
-      o.avg_opening_spread,
       o.avg_over_under,
-      o.avg_opening_over_under,
+      afs.first_fbs_season AS away_first_fbs_season,
+      hfs.first_fbs_season AS home_first_fbs_season,
       arr.points AS away_recruiting_points,
       hrr.points AS home_recruiting_points,
       atc.talent AS away_talent,
       htc.talent AS home_talent,
       arp.total_ppa AS away_returning_production_total_ppa,
       hrp.total_ppa AS home_returning_production_total_ppa,
-      aasp.offense_totalppa_prior_avg AS away_offense_totalppa_prior_avg,
-      hasp.offense_totalppa_prior_avg AS home_offense_totalppa_prior_avg,
-      aasp.offense_successrate_prior_avg AS away_offense_successrate_prior_avg,
-      hasp.offense_successrate_prior_avg AS home_offense_successrate_prior_avg,
-      aasp.offense_explosiveness_prior_avg AS away_offense_explosiveness_prior_avg,
-      hasp.offense_explosiveness_prior_avg AS home_offense_explosiveness_prior_avg,
-      aasp.defense_totalppa_prior_avg AS away_defense_totalppa_prior_avg,
-      hasp.defense_totalppa_prior_avg AS home_defense_totalppa_prior_avg,
-      aasp.defense_successrate_prior_avg AS away_defense_successrate_prior_avg,
-      hasp.defense_successrate_prior_avg AS home_defense_successrate_prior_avg,
-      aasp.defense_explosiveness_prior_avg AS away_defense_explosiveness_prior_avg,
-      hasp.defense_explosiveness_prior_avg AS home_defense_explosiveness_prior_avg
+      {away_prior_select_sql},
+      {away_actual_select_sql}
     FROM g
     LEFT JOIN odds o
       ON o.id = g.id
+    LEFT JOIN first_fbs_seasons afs
+      ON afs.team = g.awayteam
+    LEFT JOIN first_fbs_seasons hfs
+      ON hfs.team = g.hometeam
     LEFT JOIN public.team_recruiting_rankings arr
       ON arr.team = g.awayteam
      AND arr.year = g.season
@@ -214,208 +235,384 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
     LEFT JOIN advanced_stats_prior hasp
       ON hasp.game_id = g.id
      AND hasp.team = g.hometeam
+    LEFT JOIN advanced_base aactual
+      ON aactual.game_id = g.id
+     AND aactual.team = g.awayteam
+    LEFT JOIN advanced_base hactual
+      ON hactual.game_id = g.id
+     AND hactual.team = g.hometeam
     ORDER BY g.season, g.week, g.gamedate, g.id
     """
+
     df = pd.read_sql(sql, conn, params=(max_season, max_season))
     if df.empty:
         raise RuntimeError("Modeling query returned no rows.")
+
+    diff_pairs = {
+        "recruiting_diff": ("away_recruiting_points", "home_recruiting_points"),
+        "talent_diff": ("away_talent", "home_talent"),
+        "returning_diff": (
+            "away_returning_production_total_ppa",
+            "home_returning_production_total_ppa",
+        ),
+    }
+    for metric in ADVANCED_METRICS:
+        diff_pairs[f"{metric}_prior_avg_diff"] = (
+            f"away_{metric}_prior_avg",
+            f"home_{metric}_prior_avg",
+        )
+        diff_pairs[f"{metric}_game_diff"] = (
+            f"away_{metric}_actual",
+            f"home_{metric}_actual",
+        )
+
+    for diff_col, (away_col, home_col) in diff_pairs.items():
+        df[diff_col] = (
+            pd.to_numeric(df.get(away_col), errors="coerce")
+            - pd.to_numeric(df.get(home_col), errors="coerce")
+        )
+
     return df
 
 
-# ─────────────────────────────
-# Train win + spread models
-# ─────────────────────────────
-def train_models(df: pd.DataFrame, current_season: int):
-    """
-    Train line-aware and fallback game-level models.
+def recompute_preseason_diffs(df: pd.DataFrame) -> None:
+    for metric, (away_col, home_col) in PRESEASON_VALUE_COLS.items():
+        df[f"{metric}_diff"] = (
+            pd.to_numeric(df[away_col], errors="coerce")
+            - pd.to_numeric(df[home_col], errors="coerce")
+        )
 
-    Common features for every version:
-      - home/away returning production
-      - week
-      - advanced-stat-by-week interaction terms
 
-    Line-aware versions add:
-      - avg_spread for win + spread models
-      - avg_over_under for total-points model
-
-    Fallback versions:
-      - use only the common features
-    """
-
-    df = df.copy()
-
-    base_numeric_cols = [
-        "home_returning_production_total_ppa",
-        "away_returning_production_total_ppa",
-        "week",
+def fill_preseason_inputs_with_second_fbs_averages(
+    df: pd.DataFrame,
+    current_season: int,
+) -> None:
+    team_frames = []
+    side_specs = [
+        (
+            "awayteam",
+            "away_first_fbs_season",
+            {
+                "recruiting": "away_recruiting_points",
+                "talent": "away_talent",
+                "returning": "away_returning_production_total_ppa",
+            },
+        ),
+        (
+            "hometeam",
+            "home_first_fbs_season",
+            {
+                "recruiting": "home_recruiting_points",
+                "talent": "home_talent",
+                "returning": "home_returning_production_total_ppa",
+            },
+        ),
     ]
 
-    advanced_stat_cols = [
-        "home_offense_totalppa_prior_avg",
-        "away_offense_totalppa_prior_avg",
-        "home_offense_successrate_prior_avg",
-        "away_offense_successrate_prior_avg",
-        "home_offense_explosiveness_prior_avg",
-        "away_offense_explosiveness_prior_avg",
-        "home_defense_totalppa_prior_avg",
-        "away_defense_totalppa_prior_avg",
-        "home_defense_successrate_prior_avg",
-        "away_defense_successrate_prior_avg",
-        "home_defense_explosiveness_prior_avg",
-        "away_defense_explosiveness_prior_avg",
+    for team_col, first_fbs_col, value_cols in side_specs:
+        frame = df[["season", team_col, first_fbs_col] + list(value_cols.values())].rename(
+            columns={
+                team_col: "team",
+                first_fbs_col: "first_fbs_season",
+                **{col: metric for metric, col in value_cols.items()},
+            }
+        )
+        team_frames.append(frame)
+
+    team_seasons = (
+        pd.concat(team_frames, ignore_index=True)
+        .dropna(subset=["team", "season"])
+        .drop_duplicates(subset=["team", "season"])
+    )
+    for metric in PRESEASON_VALUE_COLS:
+        team_seasons[metric] = pd.to_numeric(team_seasons[metric], errors="coerce")
+
+    historical = team_seasons[pd.to_numeric(team_seasons["season"], errors="coerce") < current_season]
+    second_fbs_historical = historical[
+        pd.to_numeric(historical["season"], errors="coerce")
+        == pd.to_numeric(historical["first_fbs_season"], errors="coerce") + 1
     ]
+    fill_values = (
+        second_fbs_historical[list(PRESEASON_VALUE_COLS.keys())]
+        .mean()
+        .fillna(historical[list(PRESEASON_VALUE_COLS.keys())].mean())
+        .fillna(0.0)
+    )
 
-    # Week numeric
-    df["week"] = df["week"].astype(float)
+    for metric, (away_col, home_col) in PRESEASON_VALUE_COLS.items():
+        for col in [away_col, home_col]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.loc[df[col].isna(), col] = float(fill_values[metric])
 
-    # Track whether market inputs are actually available before filling nulls.
-    df["has_spread_line"] = df["avg_spread"].notna() if "avg_spread" in df.columns else False
-    df["has_total_line"] = df["avg_over_under"].notna() if "avg_over_under" in df.columns else False
+    recompute_preseason_diffs(df)
 
-    # Ensure all numeric predictors exist, coerce to numeric, then fill missing.
-    numeric_source_cols = base_numeric_cols + advanced_stat_cols + ["avg_spread", "avg_over_under"]
-    for col in numeric_source_cols:
+
+def advanced_feature_target_col(feature_col: str) -> str:
+    return feature_col.replace("_prior_avg_diff", "_game_diff")
+
+
+def build_linear_pipeline(feature_cols: list[str]) -> Pipeline:
+    preprocess = ColumnTransformer(transformers=[("num", StandardScaler(), feature_cols)])
+    return Pipeline(steps=[("preprocess", preprocess), ("linreg", LinearRegression())])
+
+
+def build_logistic_pipeline(feature_cols: list[str]) -> Pipeline:
+    preprocess = ColumnTransformer(transformers=[("num", StandardScaler(), feature_cols)])
+    return Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("logreg", LogisticRegression(max_iter=1000, solver="lbfgs")),
+        ]
+    )
+
+
+def predict_auxiliary_values(
+    df: pd.DataFrame,
+    fit_mask: pd.Series,
+    predict_mask: pd.Series,
+    feature_cols: list[str],
+    target_col: str,
+):
+    if not predict_mask.any():
+        return None
+
+    fit_cols = feature_cols + [target_col]
+    fit_df = df.loc[fit_mask, fit_cols].copy()
+    for col in fit_cols:
+        fit_df[col] = pd.to_numeric(fit_df[col], errors="coerce")
+    fit_df = fit_df.dropna()
+    if len(fit_df) < MIN_AUXILIARY_TRAINING_ROWS:
+        return None
+
+    predict_df = df.loc[predict_mask, feature_cols].copy()
+    for col in feature_cols:
+        predict_df[col] = pd.to_numeric(predict_df[col], errors="coerce")
+    predict_df = predict_df.fillna(0.0)
+
+    model = build_linear_pipeline(feature_cols)
+    model.fit(fit_df[feature_cols], fit_df[target_col].astype(float))
+    return pd.Series(model.predict(predict_df[feature_cols]), index=predict_df.index)
+
+
+def fill_week1_advanced_diffs_with_auxiliary_models(
+    df: pd.DataFrame,
+    current_season: int,
+) -> None:
+    for col in PRESEASON_IMPUTER_FEATURES + ["avg_spread", "avg_over_under"]:
         if col not in df.columns:
             df[col] = np.nan
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Create week interactions for the advanced stats.
-    interaction_cols = []
-    for col in advanced_stat_cols:
-        inter_col = f"{col}_week"
-        interaction_cols.append(inter_col)
-        df[inter_col] = df[col] * df["week"]
+    df["_week_numeric"] = pd.to_numeric(df["week"], errors="coerce")
+    df["_season_numeric"] = pd.to_numeric(df["season"], errors="coerce")
+    df["_has_both_lines"] = df["avg_spread"].notna() & df["avg_over_under"].notna()
 
-    # Fill predictors after interaction creation so week 1 / missing priors resolve to 0.
-    model_numeric_cols = base_numeric_cols + advanced_stat_cols + interaction_cols + ["avg_spread", "avg_over_under"]
-    for col in model_numeric_cols:
-        df[col] = df[col].fillna(0.0)
+    seasons = sorted(
+        int(s)
+        for s in df["_season_numeric"].dropna().unique().tolist()
+        if int(s) <= current_season
+    )
+    for feature_col in ADVANCED_DIFF_FEATURES:
+        target_col = advanced_feature_target_col(feature_col)
+        if target_col not in df.columns:
+            continue
 
-    # Targets from the home-team perspective.
-    df["spread_target"] = pd.to_numeric(df["homepoints"], errors="coerce") - pd.to_numeric(df["awaypoints"], errors="coerce")
-    df["win_target"] = (pd.to_numeric(df["homepoints"], errors="coerce") > pd.to_numeric(df["awaypoints"], errors="coerce")).astype(float)
-    df["total_points_target"] = pd.to_numeric(df["homepoints"], errors="coerce") + pd.to_numeric(df["awaypoints"], errors="coerce")
+        df[feature_col] = pd.to_numeric(df[feature_col], errors="coerce")
+        df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
 
-    common_train_mask = (
-        (df["season"] < current_season)
-        & df["homepoints"].notna()
-        & df["awaypoints"].notna()
+        for season in seasons:
+            prediction_mask = (
+                df["_season_numeric"].eq(season)
+                & df["_week_numeric"].eq(1)
+                & df[feature_col].isna()
+            )
+            if not prediction_mask.any():
+                continue
+
+            historical_week1_mask = (
+                df["_season_numeric"].lt(season)
+                & df["_week_numeric"].eq(1)
+                & df[target_col].notna()
+            )
+            if not historical_week1_mask.any():
+                continue
+
+            line_prediction_mask = prediction_mask & df["_has_both_lines"]
+            fallback_prediction_mask = prediction_mask & ~df["_has_both_lines"]
+
+            line_predictions = predict_auxiliary_values(
+                df,
+                historical_week1_mask & df["_has_both_lines"],
+                line_prediction_mask,
+                LINE_AWARE_IMPUTER_FEATURES,
+                target_col,
+            )
+            if line_predictions is None:
+                line_predictions = predict_auxiliary_values(
+                    df,
+                    historical_week1_mask,
+                    line_prediction_mask,
+                    PRESEASON_IMPUTER_FEATURES,
+                    target_col,
+                )
+
+            fallback_predictions = predict_auxiliary_values(
+                df,
+                historical_week1_mask,
+                fallback_prediction_mask,
+                PRESEASON_IMPUTER_FEATURES,
+                target_col,
+            )
+
+            for predictions in [line_predictions, fallback_predictions]:
+                if predictions is not None:
+                    df.loc[predictions.index, feature_col] = predictions
+
+    df.drop(columns=["_week_numeric", "_season_numeric", "_has_both_lines"], inplace=True)
+
+
+def train_models(df: pd.DataFrame, current_season: int):
+    df = df.copy()
+    df["has_spread_line"] = df["avg_spread"].notna() if "avg_spread" in df.columns else False
+    df["has_total_line"] = df["avg_over_under"].notna() if "avg_over_under" in df.columns else False
+
+    fill_preseason_inputs_with_second_fbs_averages(df, current_season)
+    fill_week1_advanced_diffs_with_auxiliary_models(df, current_season)
+
+    model_1_spread_features = ["avg_spread"] + BASE_DIFF_FEATURES
+    model_1_total_features = ["avg_over_under"] + BASE_DIFF_FEATURES
+    model_2_features = BASE_DIFF_FEATURES + MODEL_2_EXTRA_DIFF_FEATURES
+    model_numeric_cols = sorted(
+        set(model_1_spread_features + model_1_total_features + model_2_features)
     )
 
-    train_df = df[common_train_mask].copy()
+    for col in model_numeric_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    df["spread_target"] = (
+        pd.to_numeric(df["homepoints"], errors="coerce")
+        - pd.to_numeric(df["awaypoints"], errors="coerce")
+    )
+    df["win_target"] = (
+        pd.to_numeric(df["homepoints"], errors="coerce")
+        > pd.to_numeric(df["awaypoints"], errors="coerce")
+    ).astype(float)
+    df["total_points_target"] = (
+        pd.to_numeric(df["homepoints"], errors="coerce")
+        + pd.to_numeric(df["awaypoints"], errors="coerce")
+    )
+
+    train_df = df[
+        (pd.to_numeric(df["season"], errors="coerce") < current_season)
+        & df["homepoints"].notna()
+        & df["awaypoints"].notna()
+    ].copy()
     if train_df.empty:
         raise RuntimeError("No completed historical games available for model training.")
 
-    common_features = base_numeric_cols + interaction_cols
-    spread_win_line_features = common_features + ["avg_spread"]
-    spread_win_fallback_features = common_features
-    total_line_features = common_features + ["avg_over_under"]
-    total_fallback_features = common_features
-
     train_df_spread_line = train_df[train_df["has_spread_line"]].copy()
     train_df_total_line = train_df[train_df["has_total_line"]].copy()
-
-    def build_linear_pipeline(feature_cols):
-        preprocess = ColumnTransformer(
-            transformers=[("num", StandardScaler(), feature_cols)]
-        )
-        return Pipeline(
-            steps=[
-                ("preprocess", preprocess),
-                ("linreg", LinearRegression()),
-            ]
-        )
-
-    def build_logistic_pipeline(feature_cols):
-        preprocess = ColumnTransformer(
-            transformers=[("num", StandardScaler(), feature_cols)]
-        )
-        return Pipeline(
-            steps=[
-                ("preprocess", preprocess),
-                ("logreg", LogisticRegression(max_iter=1000, solver="lbfgs")),
-            ]
-        )
-
     if train_df_spread_line.empty:
         raise RuntimeError("No historical games with spread data available for line-aware win/spread models.")
     if train_df_total_line.empty:
         raise RuntimeError("No historical games with total-line data available for line-aware total model.")
 
-    # Line-aware WIN/SPREAD models
-    win_model = build_logistic_pipeline(spread_win_line_features)
-    print(f"Training WIN model (line-aware) on {len(train_df_spread_line)} rows...")
-    win_model.fit(
-        train_df_spread_line[spread_win_line_features],
-        train_df_spread_line["win_target"].astype(int),
-    )
-    print("✅ Win model (line-aware) trained.")
-
-    spread_model = build_linear_pipeline(spread_win_line_features)
-    print(f"Training SPREAD model (line-aware) on {len(train_df_spread_line)} rows...")
-    spread_model.fit(
-        train_df_spread_line[spread_win_line_features],
-        train_df_spread_line["spread_target"].astype(float),
-    )
-    print("✅ Spread model (line-aware) trained.")
-
-    # Fallback WIN/SPREAD models
-    win_fallback_model = build_logistic_pipeline(spread_win_fallback_features)
-    print(f"Training WIN model (fallback) on {len(train_df)} rows...")
-    win_fallback_model.fit(
-        train_df[spread_win_fallback_features],
-        train_df["win_target"].astype(int),
-    )
-    print("✅ Win model (fallback) trained.")
-
-    spread_fallback_model = build_linear_pipeline(spread_win_fallback_features)
-    print(f"Training SPREAD model (fallback) on {len(train_df)} rows...")
-    spread_fallback_model.fit(
-        train_df[spread_win_fallback_features],
-        train_df["spread_target"].astype(float),
-    )
-    print("✅ Spread model (fallback) trained.")
-
-    # Line-aware TOTAL model
-    total_model = build_linear_pipeline(total_line_features)
-    print(f"Training TOTAL model (line-aware) on {len(train_df_total_line)} rows...")
-    total_model.fit(
-        train_df_total_line[total_line_features],
-        train_df_total_line["total_points_target"].astype(float),
-    )
-    print("✅ Total model (line-aware) trained.")
-
-    # Fallback TOTAL model
-    total_fallback_model = build_linear_pipeline(total_fallback_features)
-    print(f"Training TOTAL model (fallback) on {len(train_df)} rows...")
-    total_fallback_model.fit(
-        train_df[total_fallback_features],
-        train_df["total_points_target"].astype(float),
-    )
-    print("✅ Total model (fallback) trained.")
-
-    # Store feature lists in attrs for scoring later.
-    df.attrs["spread_win_line_features"] = spread_win_line_features
-    df.attrs["spread_win_fallback_features"] = spread_win_fallback_features
-    df.attrs["total_line_features"] = total_line_features
-    df.attrs["total_fallback_features"] = total_fallback_features
-    df.attrs["categorical_features"] = []
-
     model_bundle = {
-        "win_line": win_model,
-        "spread_line": spread_model,
-        "total_line": total_model,
-        "win_fallback": win_fallback_model,
-        "spread_fallback": spread_fallback_model,
-        "total_fallback": total_fallback_model,
+        "win_line": build_logistic_pipeline(model_1_spread_features),
+        "spread_line": build_linear_pipeline(model_1_spread_features),
+        "total_line": build_linear_pipeline(model_1_total_features),
+        "win_model_2": build_logistic_pipeline(model_2_features),
+        "spread_model_2": build_linear_pipeline(model_2_features),
+        "total_model_2": build_linear_pipeline(model_2_features),
     }
 
+    print(f"Training WIN model (line-aware) on {len(train_df_spread_line)} rows...")
+    model_bundle["win_line"].fit(
+        train_df_spread_line[model_1_spread_features],
+        train_df_spread_line["win_target"].astype(int),
+    )
+    print(f"Training SPREAD model (line-aware) on {len(train_df_spread_line)} rows...")
+    model_bundle["spread_line"].fit(
+        train_df_spread_line[model_1_spread_features],
+        train_df_spread_line["spread_target"].astype(float),
+    )
+    print(f"Training TOTAL model (line-aware) on {len(train_df_total_line)} rows...")
+    model_bundle["total_line"].fit(
+        train_df_total_line[model_1_total_features],
+        train_df_total_line["total_points_target"].astype(float),
+    )
+
+    print(f"Training WIN model (Model 2, no line) on {len(train_df)} rows...")
+    model_bundle["win_model_2"].fit(
+        train_df[model_2_features],
+        train_df["win_target"].astype(int),
+    )
+    print(f"Training SPREAD model (Model 2, no line) on {len(train_df)} rows...")
+    model_bundle["spread_model_2"].fit(
+        train_df[model_2_features],
+        train_df["spread_target"].astype(float),
+    )
+    print(f"Training TOTAL model (Model 2, no line) on {len(train_df)} rows...")
+    model_bundle["total_model_2"].fit(
+        train_df[model_2_features],
+        train_df["total_points_target"].astype(float),
+    )
+
+    df.attrs["win_line_features"] = model_1_spread_features
+    df.attrs["spread_line_features"] = model_1_spread_features
+    df.attrs["total_line_features"] = model_1_total_features
+    df.attrs["win_model_2_features"] = model_2_features
+    df.attrs["spread_model_2_features"] = model_2_features
+    df.attrs["total_model_2_features"] = model_2_features
     return model_bundle, df
 
 
-# ─────────────────────────────
-# Predictions table helpers
-# ─────────────────────────────
+def score_current_season(model_bundle: dict, modeled_df: pd.DataFrame, current_season: int) -> pd.DataFrame:
+    current_df = modeled_df[pd.to_numeric(modeled_df["season"], errors="coerce").eq(current_season)].copy()
+    if current_df.empty:
+        raise RuntimeError(f"No rows found for current season {current_season}.")
+
+    current_df["homewinprob_with_spread"] = model_bundle["win_line"].predict_proba(
+        current_df[modeled_df.attrs["win_line_features"]]
+    )[:, 1]
+    current_df["homewinprob_without_spread"] = model_bundle["win_model_2"].predict_proba(
+        current_df[modeled_df.attrs["win_model_2_features"]]
+    )[:, 1]
+    current_df["homespread_with_spread"] = -model_bundle["spread_line"].predict(
+        current_df[modeled_df.attrs["spread_line_features"]]
+    )
+    current_df["homespread_without_spread"] = -model_bundle["spread_model_2"].predict(
+        current_df[modeled_df.attrs["spread_model_2_features"]]
+    )
+    current_df["totalpred_with_total"] = model_bundle["total_line"].predict(
+        current_df[modeled_df.attrs["total_line_features"]]
+    )
+    current_df["totalpred_without_total"] = model_bundle["total_model_2"].predict(
+        current_df[modeled_df.attrs["total_model_2_features"]]
+    )
+
+    current_df["homewinprob"] = np.where(
+        current_df["has_spread_line"],
+        current_df["homewinprob_with_spread"],
+        current_df["homewinprob_without_spread"],
+    )
+    current_df["homespread"] = np.where(
+        current_df["has_spread_line"],
+        current_df["homespread_with_spread"],
+        current_df["homespread_without_spread"],
+    )
+    current_df["totalpred"] = np.where(
+        current_df["has_total_line"],
+        current_df["totalpred_with_total"],
+        current_df["totalpred_without_total"],
+    )
+    current_df["awaywinprob"] = 1.0 - current_df["homewinprob"]
+    current_df["awayspread"] = -current_df["homespread"]
+    return current_df.sort_values(["week", "id"]).reset_index(drop=True)
+
+
 CREATE_PRED_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.game_predictions (
     gameid        TEXT PRIMARY KEY,
@@ -471,16 +668,40 @@ DO UPDATE SET
 """
 
 
-def ensure_predictions_table(conn):
+def ensure_predictions_table(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(CREATE_PRED_TABLE_SQL)
     conn.commit()
 
 
-# ─────────────────────────────
-# Main
-# ─────────────────────────────
-def main():
+def prediction_records(preds: pd.DataFrame) -> list[dict]:
+    output = preds.copy()
+    output["gameid"] = output["id"].astype(str)
+    output["home_team"] = output["hometeam"]
+    output["away_team"] = output["awayteam"]
+    output["model_version"] = MODEL_VERSION
+    output = output[
+        [
+            "gameid",
+            "season",
+            "week",
+            "home_team",
+            "away_team",
+            "homepoints",
+            "awaypoints",
+            "homespread",
+            "awayspread",
+            "totalpred",
+            "homewinprob",
+            "awaywinprob",
+            "model_version",
+        ]
+    ]
+    output = output.astype(object).where(pd.notna(output), None)
+    return output.to_dict(orient="records")
+
+
+def main() -> None:
     cfg = load_config()
     print("Connecting to database...")
     with psycopg.connect(cfg.pg_dsn) as conn:
@@ -491,97 +712,26 @@ def main():
         df = build_modeling_table(conn, max_season=current_season)
         print(f"Modeling table rows: {len(df)}")
 
-        # Train models
         model_bundle, modeled_df = train_models(df, current_season)
-
-        current_df = modeled_df[modeled_df["season"] == current_season].copy()
-        if current_df.empty:
-            raise RuntimeError(f"No rows found for current season {current_season}.")
-
-        spread_win_line_features = modeled_df.attrs["spread_win_line_features"]
-        spread_win_fallback_features = modeled_df.attrs["spread_win_fallback_features"]
-        total_line_features = modeled_df.attrs["total_line_features"]
-        total_fallback_features = modeled_df.attrs["total_fallback_features"]
-
-        print(f"Scoring {len(current_df)} games for season {current_season}...")
-        spread_line_mask = current_df["has_spread_line"].astype(bool)
-        total_line_mask = current_df["has_total_line"].astype(bool)
-
-        current_df["homewinprob"] = np.nan
-        current_df["homespread"] = np.nan
-        current_df["totalpred"] = np.nan
-
-        if spread_line_mask.any():
-            current_df.loc[spread_line_mask, "homewinprob"] = model_bundle["win_line"].predict_proba(
-                current_df.loc[spread_line_mask, spread_win_line_features]
-            )[:, 1]
-            current_df.loc[spread_line_mask, "homespread"] = -model_bundle["spread_line"].predict(
-                current_df.loc[spread_line_mask, spread_win_line_features]
-            )
-
-        if (~spread_line_mask).any():
-            current_df.loc[~spread_line_mask, "homewinprob"] = model_bundle["win_fallback"].predict_proba(
-                current_df.loc[~spread_line_mask, spread_win_fallback_features]
-            )[:, 1]
-            current_df.loc[~spread_line_mask, "homespread"] = -model_bundle["spread_fallback"].predict(
-                current_df.loc[~spread_line_mask, spread_win_fallback_features]
-            )
-
-        if total_line_mask.any():
-            current_df.loc[total_line_mask, "totalpred"] = model_bundle["total_line"].predict(
-                current_df.loc[total_line_mask, total_line_features]
-            )
-
-        if (~total_line_mask).any():
-            current_df.loc[~total_line_mask, "totalpred"] = model_bundle["total_fallback"].predict(
-                current_df.loc[~total_line_mask, total_fallback_features]
-            )
-
-        current_df["awaywinprob"] = 1.0 - current_df["homewinprob"]
-        current_df["awayspread"] = -current_df["homespread"]
-
-        current_df["gameid"] = current_df["id"].astype(str)
-        current_df["home_team"] = current_df["hometeam"]
-        current_df["away_team"] = current_df["awayteam"]
-        current_df["model_version"] = MODEL_VERSION
-
-        preds = current_df[
-            [
-                "gameid",
-                "season",
-                "week",
-                "home_team",
-                "away_team",
-                "homepoints",
-                "awaypoints",
-                "homespread",
-                "awayspread",
-                "totalpred",
-                "homewinprob",
-                "awaywinprob",
-                "model_version",
-            ]
-        ].copy()
-
-        print(f"Prepared {len(preds)} game-level predictions for season {current_season}.")
+        preds = score_current_season(model_bundle, modeled_df, current_season)
+        records = prediction_records(preds)
+        print(f"Prepared {len(records)} game-level predictions for season {current_season}.")
 
         ensure_predictions_table(conn)
-
         with conn.cursor() as cur:
             print(f"Deleting existing predictions for season {current_season}...")
             cur.execute("DELETE FROM public.game_predictions WHERE season = %s;", (current_season,))
 
             print("Inserting new predictions...")
-            records = preds.to_dict(orient="records")
             cur.executemany(INSERT_PRED_SQL, records)
 
         conn.commit()
-        print(f"✅ Finished updating game_predictions for season {current_season}.")
+        print(f"Finished updating game_predictions for season {current_season}.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"❌ nightly_predictions.py failed: {e}")
+        print(f"update_game_predictions.py failed: {e}")
         sys.exit(1)
