@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from pathlib import Path
 
 # Keep local model-testing runs single-threaded to avoid OpenMP SHM issues.
@@ -30,11 +31,14 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
+from pandas.errors import PerformanceWarning
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+
+warnings.simplefilter("ignore", PerformanceWarning)
 
 MODEL_DIR = Path(__file__).resolve().parent
 DEFAULT_TEST_SEASON = 2025
@@ -104,6 +108,8 @@ PRESEASON_IMPUTER_FEATURES = [
 
 LINE_AWARE_IMPUTER_FEATURES = PRESEASON_IMPUTER_FEATURES + ["avg_spread", "avg_over_under"]
 MIN_AUXILIARY_TRAINING_ROWS = 10
+FCS_PREDICTION_TYPE = "FCS"
+FBS_PREDICTION_TYPE = "FBS"
 
 
 def load_csv(table_name: str) -> pd.DataFrame:
@@ -179,6 +185,8 @@ def build_modeling_table(max_season: int) -> pd.DataFrame:
     g["gamedate"] = g["startdate"].dt.date
     g["homepoints"] = pd.to_numeric(g["homepoints"], errors="coerce")
     g["awaypoints"] = pd.to_numeric(g["awaypoints"], errors="coerce")
+    g["homeclassification"] = g["homeclassification"].fillna("").astype(str).str.lower()
+    g["awayclassification"] = g["awayclassification"].fillna("").astype(str).str.lower()
 
     home_fbs_seasons = g[g["homeclassification"].eq("fbs")][["hometeam", "season"]].rename(
         columns={"hometeam": "team"}
@@ -196,8 +204,10 @@ def build_modeling_table(max_season: int) -> pd.DataFrame:
 
     g = g[
         g["season"].between(2015, max_season, inclusive="both")
-        & g["homeclassification"].eq("fbs")
-        & g["awayclassification"].eq("fbs")
+        & (
+            (g["homeclassification"].eq("fbs") & g["awayclassification"].isin(["fbs", "fcs"]))
+            | (g["awayclassification"].eq("fbs") & g["homeclassification"].isin(["fbs", "fcs"]))
+        )
         & g["startdate"].notna()
     ][
         [
@@ -210,6 +220,8 @@ def build_modeling_table(max_season: int) -> pd.DataFrame:
             "conferencegame",
             "hometeam",
             "awayteam",
+            "homeclassification",
+            "awayclassification",
             "homepoints",
             "awaypoints",
         ]
@@ -379,6 +391,41 @@ def recompute_preseason_diffs(df: pd.DataFrame) -> None:
         )
 
 
+def normalized_classification(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series("", index=df.index)
+    return df[col].fillna("").astype(str).str.lower()
+
+
+def assign_prediction_type(df: pd.DataFrame) -> None:
+    is_fcs_game = (
+        normalized_classification(df, "homeclassification").eq("fcs")
+        | normalized_classification(df, "awayclassification").eq("fcs")
+    )
+    df["prediction_type"] = np.where(is_fcs_game, FCS_PREDICTION_TYPE, FBS_PREDICTION_TYPE)
+
+
+def fcs_advanced_baseline_quantile(metric: str) -> float:
+    if metric.startswith("defense_") or metric == "offense_stuffrate":
+        return 0.95
+    return 0.05
+
+
+def recompute_advanced_diffs(df: pd.DataFrame) -> None:
+    for feature_col in ADVANCED_DIFF_FEATURES:
+        metric = feature_col.replace("_prior_avg_diff", "")
+        away_col = f"away_{metric}_prior_avg"
+        home_col = f"home_{metric}_prior_avg"
+        if away_col not in df.columns:
+            df[away_col] = np.nan
+        if home_col not in df.columns:
+            df[home_col] = np.nan
+        df[feature_col] = (
+            pd.to_numeric(df[away_col], errors="coerce")
+            - pd.to_numeric(df[home_col], errors="coerce")
+        )
+
+
 def fill_preseason_inputs_with_second_fbs_averages(
     df: pd.DataFrame,
     current_season: int,
@@ -388,6 +435,7 @@ def fill_preseason_inputs_with_second_fbs_averages(
         (
             "away",
             "awayteam",
+            "awayclassification",
             "away_first_fbs_season",
             {
                 "recruiting": "away_recruiting_points",
@@ -398,6 +446,7 @@ def fill_preseason_inputs_with_second_fbs_averages(
         (
             "home",
             "hometeam",
+            "homeclassification",
             "home_first_fbs_season",
             {
                 "recruiting": "home_recruiting_points",
@@ -407,10 +456,13 @@ def fill_preseason_inputs_with_second_fbs_averages(
         ),
     ]
 
-    for _, team_col, first_fbs_col, value_cols in side_specs:
-        frame = df[["season", team_col, first_fbs_col] + list(value_cols.values())].rename(
+    for _, team_col, class_col, first_fbs_col, value_cols in side_specs:
+        frame = df[
+            ["season", team_col, class_col, first_fbs_col] + list(value_cols.values())
+        ].rename(
             columns={
                 team_col: "team",
+                class_col: "classification",
                 first_fbs_col: "first_fbs_season",
                 **{col: metric for metric, col in value_cols.items()},
             }
@@ -425,7 +477,10 @@ def fill_preseason_inputs_with_second_fbs_averages(
     for metric in PRESEASON_VALUE_COLS:
         team_seasons[metric] = pd.to_numeric(team_seasons[metric], errors="coerce")
 
-    historical = team_seasons[pd.to_numeric(team_seasons["season"], errors="coerce") < current_season]
+    historical = team_seasons[
+        (pd.to_numeric(team_seasons["season"], errors="coerce") < current_season)
+        & team_seasons["classification"].fillna("").astype(str).str.lower().eq("fbs")
+    ]
     second_fbs_historical = historical[
         pd.to_numeric(historical["season"], errors="coerce")
         == pd.to_numeric(historical["first_fbs_season"], errors="coerce") + 1
@@ -434,14 +489,69 @@ def fill_preseason_inputs_with_second_fbs_averages(
     second_fbs_means = second_fbs_historical[list(PRESEASON_VALUE_COLS.keys())].mean()
     overall_means = historical[list(PRESEASON_VALUE_COLS.keys())].mean()
     fill_values = second_fbs_means.fillna(overall_means).fillna(0.0)
+    fcs_fill_values = {
+        "recruiting": 0.0,
+        "talent": 0.0,
+        "returning": float(historical["returning"].quantile(0.10))
+        if historical["returning"].notna().any()
+        else 0.0,
+    }
+    historical_by_team = historical.sort_values(["team", "season"])
+    latest_historical_values = {
+        metric: historical_by_team.dropna(subset=[metric]).groupby("team")[metric].last()
+        for metric in PRESEASON_VALUE_COLS
+    }
 
-    for metric, (away_col, home_col) in PRESEASON_VALUE_COLS.items():
-        for col in [away_col, home_col]:
+    season_numeric = pd.to_numeric(df["season"], errors="coerce")
+    for _, team_col, class_col, _, value_cols in side_specs:
+        class_lower = normalized_classification(df, class_col)
+        for metric, col in value_cols.items():
             df[col] = pd.to_numeric(df[col], errors="coerce")
-            missing = df[col].isna()
-            df.loc[missing, col] = float(fill_values[metric])
+            current_fbs_missing = (
+                df[col].isna()
+                & class_lower.eq("fbs")
+                & season_numeric.eq(current_season)
+            )
+            if current_fbs_missing.any():
+                df.loc[current_fbs_missing, col] = df.loc[current_fbs_missing, team_col].map(
+                    latest_historical_values[metric]
+                )
+            fbs_missing = df[col].isna() & class_lower.eq("fbs")
+            df.loc[fbs_missing, col] = float(fill_values[metric])
+            df.loc[class_lower.eq("fcs"), col] = float(fcs_fill_values[metric])
 
     recompute_preseason_diffs(df)
+
+
+def fill_fcs_advanced_inputs_with_baselines(
+    df: pd.DataFrame,
+    current_season: int,
+) -> None:
+    season_numeric = pd.to_numeric(df["season"], errors="coerce")
+    historical_mask = season_numeric.lt(current_season)
+
+    for feature_col in ADVANCED_DIFF_FEATURES:
+        metric = feature_col.replace("_prior_avg_diff", "")
+        side_values = []
+        for side in ["away", "home"]:
+            class_col = f"{side}classification"
+            value_col = f"{side}_{metric}_prior_avg"
+            if value_col not in df.columns:
+                df[value_col] = np.nan
+            fbs_mask = historical_mask & normalized_classification(df, class_col).eq("fbs")
+            side_values.append(pd.to_numeric(df.loc[fbs_mask, value_col], errors="coerce"))
+
+        historical_values = pd.concat(side_values).dropna()
+        quantile = fcs_advanced_baseline_quantile(metric)
+        baseline = float(historical_values.quantile(quantile)) if not historical_values.empty else 0.0
+
+        for side in ["away", "home"]:
+            class_col = f"{side}classification"
+            value_col = f"{side}_{metric}_prior_avg"
+            df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+            df.loc[normalized_classification(df, class_col).eq("fcs"), value_col] = baseline
+
+    recompute_advanced_diffs(df)
 
 
 def advanced_feature_target_col(feature_col: str) -> str:
@@ -576,11 +686,13 @@ def build_logistic_pipeline(feature_cols: list[str]) -> Pipeline:
 
 def train_models(df: pd.DataFrame, current_season: int):
     df = df.copy()
+    assign_prediction_type(df)
 
     df["has_spread_line"] = df["avg_spread"].notna() if "avg_spread" in df.columns else False
     df["has_total_line"] = df["avg_over_under"].notna() if "avg_over_under" in df.columns else False
 
     fill_preseason_inputs_with_second_fbs_averages(df, current_season)
+    fill_fcs_advanced_inputs_with_baselines(df, current_season)
     fill_week1_advanced_diffs_with_auxiliary_models(df, current_season)
 
     model_1_spread_features = ["avg_spread"] + BASE_DIFF_FEATURES
@@ -792,6 +904,8 @@ def print_performance(preds: pd.DataFrame, current_season: int) -> None:
     print(f"Completed games: {len(completed)}")
     print(f"Games with spread line: {int(preds['has_spread_line'].sum())}")
     print(f"Games with total line: {int(preds['has_total_line'].sum())}")
+    if "prediction_type" in preds.columns:
+        print(f"FCS flagged games: {int(preds['prediction_type'].eq(FCS_PREDICTION_TYPE).sum())}")
 
     print()
     print("Prediction performance on completed games")
@@ -810,6 +924,28 @@ def print_performance(preds: pd.DataFrame, current_season: int) -> None:
             "chosen totalpred: "
             + format_metric_dict(compute_regression_metrics(completed["actual_total_points"], completed["totalpred"]))
         )
+
+    if "prediction_type" in preds.columns:
+        fcs_games = preds[preds["prediction_type"].eq(FCS_PREDICTION_TYPE)].copy()
+    else:
+        fcs_games = pd.DataFrame()
+    if not fcs_games.empty:
+        print()
+        print("FCS flagged prediction sample")
+        sample_cols = [
+            "week",
+            "awayteam",
+            "hometeam",
+            "has_spread_line",
+            "has_total_line",
+            "homespread",
+            "totalpred",
+            "homewinprob",
+        ]
+        sample = fcs_games[sample_cols].head(25).copy()
+        for col in ["homespread", "totalpred", "homewinprob"]:
+            sample[col] = pd.to_numeric(sample[col], errors="coerce").round(3)
+        print(sample.to_string(index=False))
 
     print()
     print("Model 1 vs Model 2 performance on completed games with spread lines")

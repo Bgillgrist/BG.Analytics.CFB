@@ -220,8 +220,21 @@ def run() -> StepResult:
         with log_timing(logger, f"{prefix} transform"):
             df = _transform_df(raw_df, cfg.season)
 
-        # For this job, empty is NOT okay. If CFBD gives 0 rows, refuse to delete.
+        # Early season can legitimately have no advanced season stats yet.
+        # Skip before load so we never delete existing data for an empty payload.
         with log_timing(logger, f"{prefix} validate"):
+            if df.empty:
+                msg = f"season={cfg.season} no advanced season stats returned; skipping without DB changes"
+                logger.info(f"{prefix} skipped | {msg}")
+                return StepResult(
+                    step_name=STEP_NAME,
+                    season=cfg.season,
+                    status="skipped",
+                    rows_fetched=int(len(raw_df)),
+                    rows_deleted=0,
+                    rows_inserted=0,
+                    message=msg,
+                )
             _validate_df(df, allow_empty=False)
 
         with log_timing(logger, f"{prefix} load"):
@@ -252,7 +265,7 @@ def run() -> StepResult:
 
 def main() -> None:
     res = run()
-    if res.status != "success":
+    if res.status not in ("success", "skipped"):
         raise SystemExit(1)
 
 
