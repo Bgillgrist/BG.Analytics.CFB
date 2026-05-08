@@ -72,8 +72,15 @@ jobs:
 #          ASOF_MAX: ${{ steps.today.outputs.date }}
 #        run: python update_team_ratings.py
 
-      - name: Update game predictions
+      # - name: Update game predictions
+      #   env:
+      #     PG_DSN: ${{ secrets.PG_DSN }}
+      #     SEASON: ${{ github.event.inputs.season }}
+      #   run: python -m etl.jobs.update_game_predictions
+
+      - name: Update full game prediction snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_game_predictions
+          GAME_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && 'manual' || 'nightly' }}
+        run: python -m etl.jobs.update_game_predictions_full
