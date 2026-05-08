@@ -30,7 +30,8 @@ from etl.common_config import load_config
 
 warnings.simplefilter("ignore", PerformanceWarning)
 
-MODEL_VERSION = "preds_2026"
+LINE_AWARE_MODEL_VERSION = "aware_2026"
+INCOMPLETE_MODEL_VERSION = "incomplete_2026"
 ADVANCED_GAME_KEY_COLS = ["game_id", "season", "season_type", "week", "team", "opponent"]
 
 BASE_DIFF_FEATURES = [
@@ -800,7 +801,11 @@ def prediction_records(preds: pd.DataFrame) -> list[dict]:
     output["gameid"] = output["id"].astype(str)
     output["home_team"] = output["hometeam"]
     output["away_team"] = output["awayteam"]
-    output["model_version"] = MODEL_VERSION
+    output["model_version"] = np.where(
+        output["has_spread_line"].astype(bool) & output["has_total_line"].astype(bool),
+        LINE_AWARE_MODEL_VERSION,
+        INCOMPLETE_MODEL_VERSION,
+    )
     if "prediction_type" not in output.columns:
         output["prediction_type"] = FBS_PREDICTION_TYPE
     output = output[
