@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -43,6 +43,7 @@ from etl.jobs.update_game_predictions import (
 RUN_TYPE_ENV = "GAME_PREDICTION_RUN_TYPE"
 RUN_DATE_ENV = "GAME_PREDICTION_RUN_DATE"
 NOTES_ENV = "GAME_PREDICTION_RUN_NOTES"
+HASH_EXCLUDED_COLUMNS = {"homepoints", "awaypoints"}
 
 CREATE_RUNS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.game_prediction_runs (
@@ -177,6 +178,18 @@ ORDER BY created_at DESC
 LIMIT 1;
 """
 
+LATEST_SUCCESSFUL_RUN_BY_DATE_SQL = """
+SELECT game_prediction_run_id, prediction_hash
+FROM public.game_prediction_runs
+WHERE season = %s
+  AND run_type = %s
+  AND run_date = %s
+  AND status = 'success'
+  AND prediction_hash IS NOT NULL
+ORDER BY created_at DESC
+LIMIT 1;
+"""
+
 INSERT_DETAIL_SQL = """
 INSERT INTO public.game_predictions_full (
     game_prediction_run_id,
@@ -216,12 +229,26 @@ VALUES (
 );
 """
 
+FINALIZE_SCORE_SQL = """
+UPDATE public.game_predictions_full
+SET
+    homepoints = %(homepoints)s,
+    awaypoints = %(awaypoints)s
+WHERE season = %(season)s
+  AND gameid = %(gameid)s
+  AND (homepoints IS NULL OR awaypoints IS NULL);
+"""
+
 
 def _run_date_from_env() -> date:
     raw = os.getenv(RUN_DATE_ENV, "").strip()
     if raw:
         return date.fromisoformat(raw)
     return datetime.now(timezone.utc).date()
+
+
+def _run_date_was_supplied() -> bool:
+    return bool(os.getenv(RUN_DATE_ENV, "").strip())
 
 
 def _run_type_from_env() -> str:
@@ -348,11 +375,26 @@ def train_models_as_of(df, current_season: int, as_of_date: date):
     return model_bundle, df
 
 
-def filter_predictions_for_run_type(preds, run_type: str, run_date: date):
+def filter_predictions_for_run_type(
+    preds,
+    run_type: str,
+    run_date: date,
+    target_game_date: date | None = None,
+):
     gamedate = pd.to_datetime(preds["gamedate"], errors="coerce").dt.date
     if run_type == "backfill":
-        return preds[gamedate.gt(run_date)].copy()
+        target_date = target_game_date or run_date + timedelta(days=1)
+        return preds[gamedate.eq(target_date)].copy()
     return preds[gamedate.gt(run_date) & preds["homepoints"].isna() & preds["awaypoints"].isna()].copy()
+
+
+def backfill_game_dates(df, current_season: int) -> list[date]:
+    season_numeric = pd.to_numeric(df["season"], errors="coerce")
+    gamedates = pd.to_datetime(
+        df.loc[season_numeric.eq(current_season), "gamedate"],
+        errors="coerce",
+    ).dropna()
+    return sorted({value.date() for value in gamedates})
 
 
 def _canonical_value(value: Any) -> Any:
@@ -372,7 +414,11 @@ def _canonical_value(value: Any) -> Any:
 
 
 def _canonical_record(record: dict[str, Any]) -> dict[str, Any]:
-    return {key: _canonical_value(record.get(key)) for key in sorted(record)}
+    return {
+        key: _canonical_value(record.get(key))
+        for key in sorted(record)
+        if key not in HASH_EXCLUDED_COLUMNS
+    }
 
 
 def _hash_payload(payload: Any) -> str:
@@ -401,9 +447,52 @@ def ensure_full_prediction_tables(conn) -> None:
     conn.commit()
 
 
+def completed_score_records(df, current_season: int) -> list[dict[str, Any]]:
+    season_numeric = pd.to_numeric(df["season"], errors="coerce")
+    scored = df[
+        season_numeric.eq(current_season)
+        & df["homepoints"].notna()
+        & df["awaypoints"].notna()
+    ].copy()
+    if scored.empty:
+        return []
+
+    scored["gameid"] = scored["id"].astype(str)
+    scored = scored[["gameid", "season", "homepoints", "awaypoints"]]
+    scored = scored.drop_duplicates(subset=["gameid"], keep="last")
+    scored = scored.astype(object).where(pd.notna(scored), None)
+    return scored.to_dict(orient="records")
+
+
+def finalize_completed_scores(conn, df, current_season: int) -> int:
+    records = completed_score_records(df, current_season)
+    if not records:
+        return 0
+
+    with conn.cursor() as cur:
+        cur.executemany(FINALIZE_SCORE_SQL, records)
+        updated_count = cur.rowcount
+    conn.commit()
+    return max(updated_count, 0)
+
+
 def get_latest_successful_run(conn, season: int, run_type: str) -> tuple[str, str] | None:
     with conn.cursor() as cur:
         cur.execute(LATEST_SUCCESSFUL_RUN_SQL, (season, run_type))
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def get_latest_successful_run_for_date(
+    conn,
+    season: int,
+    run_type: str,
+    run_date: date,
+) -> tuple[str, str] | None:
+    with conn.cursor() as cur:
+        cur.execute(LATEST_SUCCESSFUL_RUN_BY_DATE_SQL, (season, run_type, run_date))
         row = cur.fetchone()
     if row is None:
         return None
@@ -491,81 +580,143 @@ def write_duplicate_run(
     conn.commit()
 
 
+def process_prediction_snapshot(
+    conn,
+    *,
+    df,
+    current_season: int,
+    run_date: date,
+    run_type: str,
+    etl_run_id: str,
+    notes: str | None,
+    target_game_date: date | None = None,
+) -> tuple[uuid.UUID, int, str]:
+    run_id = uuid.uuid4()
+    print(f"Prediction run id: {run_id}")
+    print(f"Run date/type: {run_date} / {run_type}")
+    if target_game_date is not None:
+        print(f"Backfill target game date: {target_game_date}")
+
+    model_bundle, modeled_df = train_models_as_of(df, current_season, run_date)
+    preds = score_current_season(model_bundle, modeled_df, current_season)
+    preds = filter_predictions_for_run_type(
+        preds,
+        run_type,
+        run_date,
+        target_game_date=target_game_date,
+    )
+    records = prediction_records(preds)
+    records, prediction_hash = add_prediction_hashes(records)
+    fcs_count = int(preds["prediction_type"].eq(FCS_PREDICTION_TYPE).sum())
+    print(
+        f"Prepared {len(records)} game-level predictions for season {current_season} "
+        f"({fcs_count} FCS flagged)."
+    )
+    print(f"Prediction hash: {prediction_hash}")
+
+    create_run(
+        conn,
+        run_id=run_id,
+        season=current_season,
+        run_date=run_date,
+        run_type=run_type,
+        etl_run_id=etl_run_id,
+        row_count=len(records),
+        fcs_count=fcs_count,
+        notes=notes,
+    )
+
+    try:
+        latest = (
+            get_latest_successful_run_for_date(conn, current_season, run_type, run_date)
+            if run_type == "backfill"
+            else get_latest_successful_run(conn, current_season, run_type)
+        )
+        if latest is not None:
+            latest_run_id, latest_hash = latest
+            if latest_hash == prediction_hash:
+                print(
+                    "Predictions match latest successful snapshot; "
+                    f"marking this run as duplicate of {latest_run_id}."
+                )
+                write_duplicate_run(
+                    conn,
+                    run_id=run_id,
+                    prediction_hash=prediction_hash,
+                    duplicate_of_run_id=latest_run_id,
+                )
+                print("Finished without inserting duplicate prediction detail rows.")
+                return run_id, 0, "duplicate"
+
+        print("Prediction set changed; inserting full snapshot rows...")
+        for record in records:
+            record["game_prediction_run_id"] = run_id
+        write_changed_snapshot(
+            conn,
+            run_id=run_id,
+            records=records,
+            prediction_hash=prediction_hash,
+        )
+        print(f"Finished inserting {len(records)} rows into game_predictions_full.")
+        return run_id, len(records), "success"
+    except Exception as exc:
+        conn.rollback()
+        mark_run_failed(conn, run_id, str(exc))
+        raise
+
+
 def main() -> None:
     cfg = load_config()
     current_season = cfg.season
-    run_id = uuid.uuid4()
     run_date = _run_date_from_env()
+    run_date_was_supplied = _run_date_was_supplied()
     run_type = _run_type_from_env()
     notes = os.getenv(NOTES_ENV, "").strip() or None
 
     print("Connecting to database...")
     with psycopg.connect(cfg.pg_dsn) as conn:
         print(f"Target season: {current_season}")
-        print(f"Prediction run id: {run_id}")
-        print(f"Run date/type: {run_date} / {run_type}")
 
         print("Building modeling table...")
         df = build_modeling_table(conn, max_season=current_season)
         print(f"Modeling table rows: {len(df)}")
 
-        model_bundle, modeled_df = train_models_as_of(df, current_season, run_date)
-        preds = score_current_season(model_bundle, modeled_df, current_season)
-        preds = filter_predictions_for_run_type(preds, run_type, run_date)
-        records = prediction_records(preds)
-        records, prediction_hash = add_prediction_hashes(records)
-        fcs_count = int(preds["prediction_type"].eq(FCS_PREDICTION_TYPE).sum())
-        print(
-            f"Prepared {len(records)} game-level predictions for season {current_season} "
-            f"({fcs_count} FCS flagged)."
-        )
-        print(f"Prediction hash: {prediction_hash}")
-
         ensure_full_prediction_tables(conn)
-        create_run(
+        finalized_count = finalize_completed_scores(conn, df, current_season)
+        print(f"Finalized scores on {finalized_count} existing prediction rows.")
+
+        if run_type == "backfill" and not run_date_was_supplied:
+            game_dates = backfill_game_dates(df, current_season)
+            print(
+                f"Backfilling {len(game_dates)} game dates for season {current_season}; "
+                "each run_date will be the day before its game date."
+            )
+            total_inserted = 0
+            for game_date in game_dates:
+                snapshot_run_date = game_date - timedelta(days=1)
+                _, inserted_count, _ = process_prediction_snapshot(
+                    conn,
+                    df=df,
+                    current_season=current_season,
+                    run_date=snapshot_run_date,
+                    run_type=run_type,
+                    etl_run_id=cfg.run_id,
+                    notes=notes,
+                    target_game_date=game_date,
+                )
+                total_inserted += inserted_count
+            print(f"Finished season backfill; inserted {total_inserted} prediction rows.")
+            return
+
+        process_prediction_snapshot(
             conn,
-            run_id=run_id,
-            season=current_season,
+            df=df,
+            current_season=current_season,
             run_date=run_date,
             run_type=run_type,
             etl_run_id=cfg.run_id,
-            row_count=len(records),
-            fcs_count=fcs_count,
             notes=notes,
         )
-
-        try:
-            latest = get_latest_successful_run(conn, current_season, run_type)
-            if latest is not None:
-                latest_run_id, latest_hash = latest
-                if latest_hash == prediction_hash:
-                    print(
-                        "Predictions match latest successful snapshot; "
-                        f"marking this run as duplicate of {latest_run_id}."
-                    )
-                    write_duplicate_run(
-                        conn,
-                        run_id=run_id,
-                        prediction_hash=prediction_hash,
-                        duplicate_of_run_id=latest_run_id,
-                    )
-                    print("Finished without inserting duplicate prediction detail rows.")
-                    return
-
-            print("Prediction set changed; inserting full snapshot rows...")
-            for record in records:
-                record["game_prediction_run_id"] = run_id
-            write_changed_snapshot(
-                conn,
-                run_id=run_id,
-                records=records,
-                prediction_hash=prediction_hash,
-            )
-            print(f"Finished inserting {len(records)} rows into game_predictions_full.")
-        except Exception as exc:
-            conn.rollback()
-            mark_run_failed(conn, run_id, str(exc))
-            raise
 
 
 if __name__ == "__main__":
