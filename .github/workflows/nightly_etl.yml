@@ -10,6 +10,14 @@ on:
         required: false
         type: string
         default: ""
+      prediction_run_type:
+        description: "Prediction snapshot run type for manual workflow runs."
+        required: false
+        type: choice
+        default: "manual"
+        options:
+          - manual
+          - backfill
 
 jobs:
   update-current-season:
@@ -82,5 +90,5 @@ jobs:
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
-          GAME_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && 'manual' || 'nightly' }}
+          GAME_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
         run: python -m etl.jobs.update_game_predictions_full
