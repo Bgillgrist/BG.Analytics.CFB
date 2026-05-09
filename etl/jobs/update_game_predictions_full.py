@@ -44,6 +44,24 @@ RUN_TYPE_ENV = "GAME_PREDICTION_RUN_TYPE"
 RUN_DATE_ENV = "GAME_PREDICTION_RUN_DATE"
 NOTES_ENV = "GAME_PREDICTION_RUN_NOTES"
 HASH_EXCLUDED_COLUMNS = {"homepoints", "awaypoints"}
+HASH_FLOAT_DECIMAL_PLACES = 4
+NORMAL_SNAPSHOT_RUN_TYPES = ("manual", "nightly")
+DETAIL_HASH_COLUMNS = (
+    "gameid",
+    "season",
+    "week",
+    "home_team",
+    "away_team",
+    "homepoints",
+    "awaypoints",
+    "homespread",
+    "awayspread",
+    "totalpred",
+    "homewinprob",
+    "awaywinprob",
+    "model_version",
+    "prediction_type",
+)
 
 CREATE_RUNS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS public.game_prediction_runs (
@@ -171,7 +189,7 @@ LATEST_SUCCESSFUL_RUN_SQL = """
 SELECT game_prediction_run_id, prediction_hash
 FROM public.game_prediction_runs
 WHERE season = %s
-  AND run_type = %s
+  AND run_type IN ({run_type_placeholders})
   AND status = 'success'
   AND prediction_hash IS NOT NULL
 ORDER BY created_at DESC
@@ -237,6 +255,13 @@ SET
 WHERE season = %(season)s
   AND gameid = %(gameid)s
   AND (homepoints IS NULL OR awaypoints IS NULL);
+"""
+
+DETAIL_RECORDS_FOR_RUN_SQL = f"""
+SELECT {", ".join(DETAIL_HASH_COLUMNS)}
+FROM public.game_predictions_full
+WHERE game_prediction_run_id = %s
+ORDER BY gameid;
 """
 
 
@@ -403,11 +428,11 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, float):
         if np.isnan(value):
             return None
-        return round(value, 12)
+        return round(value, HASH_FLOAT_DECIMAL_PLACES)
     if isinstance(value, np.floating):
         if np.isnan(value):
             return None
-        return round(float(value), 12)
+        return round(float(value), HASH_FLOAT_DECIMAL_PLACES)
     if isinstance(value, np.integer):
         return int(value)
     return value
@@ -437,6 +462,20 @@ def add_prediction_hashes(records: list[dict[str, Any]]) -> tuple[list[dict[str,
         enriched.append(enriched_record)
         canonical_records.append(canonical)
     return enriched, _hash_payload(canonical_records)
+
+
+def _prediction_hash_from_records(records: list[dict[str, Any]]) -> str:
+    canonical_records = [
+        _canonical_record(record)
+        for record in sorted(records, key=lambda item: str(item["gameid"]))
+    ]
+    return _hash_payload(canonical_records)
+
+
+def _comparable_run_types(run_type: str) -> tuple[str, ...]:
+    if run_type in NORMAL_SNAPSHOT_RUN_TYPES:
+        return NORMAL_SNAPSHOT_RUN_TYPES
+    return (run_type,)
 
 
 def ensure_full_prediction_tables(conn) -> None:
@@ -477,8 +516,11 @@ def finalize_completed_scores(conn, df, current_season: int) -> int:
 
 
 def get_latest_successful_run(conn, season: int, run_type: str) -> tuple[str, str] | None:
+    run_types = _comparable_run_types(run_type)
+    placeholders = ", ".join(["%s"] * len(run_types))
+    sql = LATEST_SUCCESSFUL_RUN_SQL.format(run_type_placeholders=placeholders)
     with conn.cursor() as cur:
-        cur.execute(LATEST_SUCCESSFUL_RUN_SQL, (season, run_type))
+        cur.execute(sql, (season, *run_types))
         row = cur.fetchone()
     if row is None:
         return None
@@ -497,6 +539,27 @@ def get_latest_successful_run_for_date(
     if row is None:
         return None
     return str(row[0]), str(row[1])
+
+
+def get_prediction_records_for_run(conn, run_id: str) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(DETAIL_RECORDS_FOR_RUN_SQL, (run_id,))
+        rows = cur.fetchall()
+    return [dict(zip(DETAIL_HASH_COLUMNS, row)) for row in rows]
+
+
+def prediction_hash_matches_run(
+    conn,
+    *,
+    run_id: str,
+    stored_prediction_hash: str,
+    prediction_hash: str,
+) -> bool:
+    if stored_prediction_hash == prediction_hash:
+        return True
+
+    prior_records = get_prediction_records_for_run(conn, run_id)
+    return _prediction_hash_from_records(prior_records) == prediction_hash
 
 
 def create_run(
@@ -634,9 +697,14 @@ def process_prediction_snapshot(
         )
         if latest is not None:
             latest_run_id, latest_hash = latest
-            if latest_hash == prediction_hash:
+            if prediction_hash_matches_run(
+                conn,
+                run_id=latest_run_id,
+                stored_prediction_hash=latest_hash,
+                prediction_hash=prediction_hash,
+            ):
                 print(
-                    "Predictions match latest successful snapshot; "
+                    "Predictions match latest comparable successful snapshot; "
                     f"marking this run as duplicate of {latest_run_id}."
                 )
                 write_duplicate_run(
