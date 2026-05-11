@@ -100,9 +100,9 @@ jobs:
           RANKING_PROJECTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
         run: python -m etl.jobs.update_ranking_projections
 
-      - name: Update season prediction snapshots
-        env:
-          PG_DSN: ${{ secrets.PG_DSN }}
-          SEASON: ${{ github.event.inputs.season }}
-          SEASON_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
-        run: python -m etl.jobs.update_season_predictions_full
+#      - name: Update season prediction snapshots
+#        env:
+#          PG_DSN: ${{ secrets.PG_DSN }}
+#          SEASON: ${{ github.event.inputs.season }}
+#          SEASON_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
+#        run: python -m etl.jobs.update_season_predictions_full
