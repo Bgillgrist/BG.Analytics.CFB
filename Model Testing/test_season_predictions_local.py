@@ -403,29 +403,22 @@ def select_cfp_field(
         if champion:
             auto_bids.append(champion)
 
-    group_champions = [
+    group_candidates = [
         team
-        for team in conference_champions
-        if profiles[team].get("conference") in CFP_GROUP_AUTO_CONFERENCES and team in rank_order
+        for team in ranked_fbs
+        if profiles[team].get("conference") in CFP_GROUP_AUTO_CONFERENCES
     ]
-    if group_champions:
-        auto_bids.append(min(group_champions, key=lambda team: rank_order[team]))
+    if group_candidates:
+        auto_bids.append(group_candidates[0])
+
+    if NOTRE_DAME in rank_order and rank_order[NOTRE_DAME] <= 12:
+        auto_bids.append(NOTRE_DAME)
 
     auto_bids = list(dict.fromkeys(auto_bids))
     auto_bid_set = set(auto_bids)
     at_large_slots = max(0, 12 - len(auto_bids))
     at_large = [team for team in ranked_fbs if team not in auto_bid_set][:at_large_slots]
     playoff = auto_bids + at_large
-
-    if (
-        NOTRE_DAME in rank_order
-        and rank_order[NOTRE_DAME] <= 12
-        and NOTRE_DAME not in playoff
-        and at_large
-    ):
-        lowest_at_large = max(at_large, key=lambda team: rank_order[team])
-        at_large = [team for team in at_large if team != lowest_at_large] + [NOTRE_DAME]
-        playoff = auto_bids + at_large
 
     auto_bid_set = set(auto_bids)
 
