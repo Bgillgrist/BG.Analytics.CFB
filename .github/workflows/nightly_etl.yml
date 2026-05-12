@@ -40,35 +40,35 @@ jobs:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_current_season
+        run: python -m etl.jobs.nightly_data_updates.update_current_season
 
       - name: Update team advanced season stats
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_team_advanced_stats
+        run: python -m etl.jobs.nightly_data_updates.update_team_advanced_stats
 
       - name: Update team advanced game stats
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_team_advanced_game_stats
+        run: python -m etl.jobs.nightly_data_updates.update_team_advanced_game_stats
 
       - name: Update rankings
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_rankings
+        run: python -m etl.jobs.nightly_data_updates.update_rankings
 
       - name: Update betting odds table
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           SEASON: ${{ github.event.inputs.season }}
-        run: python -m etl.jobs.update_betting_odds
+        run: python -m etl.jobs.nightly_data_updates.update_betting_odds
 
 #      - name: Add ratings for today only
 #        working-directory: etl
@@ -84,25 +84,25 @@ jobs:
       #   env:
       #     PG_DSN: ${{ secrets.PG_DSN }}
       #     SEASON: ${{ github.event.inputs.season }}
-      #   run: python -m etl.jobs.update_game_predictions
+      #   run: python -m etl.jobs.prediction_updates.update_game_predictions
 
       - name: Update full game prediction snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
           GAME_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
-        run: python -m etl.jobs.update_game_predictions_full
+        run: python -m etl.jobs.prediction_updates.update_game_predictions_full
 
       - name: Update ranking projection snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
           RANKING_PROJECTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
-        run: python -m etl.jobs.update_ranking_projections
+        run: python -m etl.jobs.prediction_updates.update_ranking_projections
 
       - name: Update season prediction snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
           SEASON_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
-        run: python -m etl.jobs.update_season_predictions_full
+        run: python -m etl.jobs.prediction_updates.update_season_predictions_full

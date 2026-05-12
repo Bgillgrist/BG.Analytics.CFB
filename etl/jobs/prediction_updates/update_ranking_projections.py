@@ -3,7 +3,7 @@
 Build team ranking projection snapshots from the latest game prediction snapshot.
 
 The job follows the same run/detail snapshot pattern as
-etl.jobs.update_game_predictions_full. A ranking projection run is tied to one
+etl.jobs.prediction_updates.update_game_predictions_full. A ranking projection run is tied to one
 successful game_prediction_run_id, so every remaining-game win probability in
 the ranking table comes from the same model snapshot.
 """

@@ -4,7 +4,7 @@ Train game prediction models from Neon data and append changed full snapshots.
 
 This job intentionally leaves public.game_predictions untouched. It reuses the
 modeling, training, scoring, and record-shaping functions from
-etl.jobs.update_game_predictions so the model output stays identical.
+etl.jobs.prediction_updates.update_game_predictions so the model output stays identical.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import pandas as pd
 import psycopg
 
 from etl.common_config import load_config
-from etl.jobs.update_game_predictions import (
+from etl.jobs.prediction_updates.update_game_predictions import (
     BASE_DIFF_FEATURES,
     FCS_PREDICTION_TYPE,
     INCOMPLETE_MODEL_VERSION,

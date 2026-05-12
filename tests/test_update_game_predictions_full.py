@@ -11,7 +11,7 @@ sys.modules.setdefault("numpy", fake_numpy)
 sys.modules.setdefault("pandas", types.ModuleType("pandas"))
 sys.modules.setdefault("psycopg", types.ModuleType("psycopg"))
 
-fake_prediction_job = types.ModuleType("etl.jobs.update_game_predictions")
+fake_prediction_job = types.ModuleType("etl.jobs.prediction_updates.update_game_predictions")
 fake_prediction_job.BASE_DIFF_FEATURES = []
 fake_prediction_job.FCS_PREDICTION_TYPE = "FCS"
 fake_prediction_job.INCOMPLETE_MODEL_VERSION = "incomplete_2026"
@@ -29,9 +29,9 @@ for name in (
     "score_current_season",
 ):
     setattr(fake_prediction_job, name, lambda *args, **kwargs: None)
-sys.modules.setdefault("etl.jobs.update_game_predictions", fake_prediction_job)
+sys.modules.setdefault("etl.jobs.prediction_updates.update_game_predictions", fake_prediction_job)
 
-from etl.jobs import update_game_predictions_full as job  # noqa: E402
+from etl.jobs.prediction_updates import update_game_predictions_full as job  # noqa: E402
 
 
 class FakeCursor:

@@ -3,7 +3,7 @@
 Build season-level team prediction snapshots from game and ranking snapshots.
 
 The job follows the same run/detail snapshot pattern as
-etl.jobs.update_game_predictions_full. It uses the game_prediction_run_id tied
+etl.jobs.prediction_updates.update_game_predictions_full. It uses the game_prediction_run_id tied
 to a successful ranking_projection_run_id so remaining-season win probabilities,
 projected rankings, CFP selection, and playoff simulation all share one coherent
 snapshot.
@@ -26,13 +26,13 @@ import pandas as pd
 import psycopg
 
 from etl.common_config import load_config
-from etl.jobs.conference_championship_rules import (
+from etl.jobs.prediction_updates.conference_championship_rules import (
     SEC_RELATIVE_OFFENSE_CAP,
     select_conference_championship_teams,
     simulate_conference_championship_game,
     sun_belt_division_for_team,
 )
-from etl.jobs.update_game_predictions import FBS_PREDICTION_TYPE, FCS_PREDICTION_TYPE
+from etl.jobs.prediction_updates.update_game_predictions import FBS_PREDICTION_TYPE, FCS_PREDICTION_TYPE
 
 
 RUN_TYPE_ENV = "SEASON_PREDICTION_RUN_TYPE"

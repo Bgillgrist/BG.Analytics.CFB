@@ -10,7 +10,7 @@ The dashboard should treat `public.game_prediction_runs` plus `public.game_predi
 
 `public.game_prediction_runs` stores one row per attempted snapshot run. Successful runs have rows in `game_predictions_full`; duplicate runs usually do not. Duplicate runs exist so the ETL can record that it ran, noticed no prediction changes, and avoided inserting another identical copy.
 
-The old `public.game_predictions` table still exists in the repo, but the nightly workflow no longer runs that job. It is a latest-only overwrite table. The active nightly workflow currently runs `etl.jobs.update_game_predictions_full`, which creates and updates the snapshot tables.
+The old `public.game_predictions` table still exists in the repo, but the nightly workflow no longer runs that job. It is a latest-only overwrite table. The active nightly workflow currently runs `etl.jobs.prediction_updates.update_game_predictions_full`, which creates and updates the snapshot tables.
 
 For dashboard work, the safest default is:
 
@@ -24,17 +24,17 @@ For dashboard work, the safest default is:
 The GitHub Actions workflow `.github/workflows/nightly_etl.yml` runs:
 
 ```bash
-python -m etl.jobs.update_game_predictions_full
+python -m etl.jobs.prediction_updates.update_game_predictions_full
 ```
 
 That job runs after the upstream data refresh steps:
 
-- `update_current_season`
-- `update_team_advanced_stats`
-- `update_team_advanced_game_stats`
-- `update_rankings`
-- `update_betting_odds`
-- `update_game_predictions_full`
+- `etl.jobs.nightly_data_updates.update_current_season`
+- `etl.jobs.nightly_data_updates.update_team_advanced_stats`
+- `etl.jobs.nightly_data_updates.update_team_advanced_game_stats`
+- `etl.jobs.nightly_data_updates.update_rankings`
+- `etl.jobs.nightly_data_updates.update_betting_odds`
+- `etl.jobs.prediction_updates.update_game_predictions_full`
 
 Manual workflow dispatch exposes:
 
@@ -347,7 +347,7 @@ Duplicate runs are meaningful metadata but do not have their own detail rows. To
 
 ## How The Full Snapshot Job Works
 
-The full snapshot job intentionally reuses the modeling, scoring, and record-shaping functions from the older `update_game_predictions.py` job. That keeps the model output identical between the old latest-only table and the new full snapshot table.
+The full snapshot job intentionally reuses the modeling, scoring, and record-shaping functions from the older `prediction_updates/update_game_predictions.py` job. That keeps the model output identical between the old latest-only table and the new full snapshot table.
 
 High-level flow:
 

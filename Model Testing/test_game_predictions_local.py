@@ -11,7 +11,7 @@ Reads CSV snapshots from the same folder as this file:
   - team_advanced_game_stats.csv
 
 Recreates the same modeling table and trains the same win/spread/total
-models as etl/jobs/update_game_predictions.py, but does not write to Neon.
+models as etl/jobs/prediction_updates/update_game_predictions.py, but does not write to Neon.
 It prints the current-season predictions to the terminal instead.
 """
 
