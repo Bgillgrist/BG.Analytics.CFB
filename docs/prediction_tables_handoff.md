@@ -1,9 +1,11 @@
 # Prediction Tables Handoff
 
-This handoff covers the six snapshot tables created for game predictions, ranking projections, and season predictions:
+This handoff covers the snapshot tables created for game predictions, team ratings, ranking projections, and season predictions:
 
 - `public.game_prediction_runs`
 - `public.game_predictions_full`
+- `public.team_rating_runs`
+- `public.team_ratings`
 - `public.ranking_projection_runs`
 - `public.ranking_projections_full`
 - `public.season_prediction_runs`
@@ -17,6 +19,7 @@ Nightly ETL runs these prediction jobs in this order:
 
 ```bash
 python -m etl.jobs.prediction_updates.update_game_predictions_full
+python -m etl.jobs.prediction_updates.update_team_ratings_full
 python -m etl.jobs.prediction_updates.update_ranking_projections
 python -m etl.jobs.prediction_updates.update_season_predictions_full
 ```
@@ -26,6 +29,11 @@ The dependency chain is:
 ```text
 game_prediction_runs
   -> game_predictions_full
+  -> team_rating_runs.game_prediction_run_id
+  -> team_ratings
+
+game_prediction_runs
+  -> game_predictions_full
   -> ranking_projection_runs.game_prediction_run_id
   -> ranking_projections_full
   -> season_prediction_runs.ranking_projection_run_id
@@ -33,6 +41,8 @@ game_prediction_runs
 ```
 
 This matters for dashboard debugging: a season prediction run is tied to a ranking projection run, and that ranking projection run is tied to a game prediction run. That gives one coherent as-of snapshot for game probabilities, projected rankings, CFP selection, and playoff simulation.
+
+Team rating runs also tie directly to a game prediction run. They use completed FBS-vs-FBS margins as of the run date plus projected margins from that game prediction snapshot, then solve a weighted SRS-style rating and home-field advantage.
 
 ## Run Table Pattern
 
@@ -130,7 +140,77 @@ JOIN latest_run r USING (game_prediction_run_id)
 ORDER BY g.week, g.home_team, g.away_team;
 ```
 
-## Table 3: `public.ranking_projection_runs`
+## Table 3: `public.team_rating_runs`
+
+One row per attempted team-rating snapshot.
+
+Primary key:
+
+- `team_rating_run_id`
+
+Important columns:
+
+- `season`, `run_date`, `run_type`
+- `etl_run_id`
+- `game_prediction_run_id`: the exact game prediction snapshot used for projected margins.
+- `created_at`, `completed_at`
+- `status`
+- `model_version`
+- `rating_hash`: hash of the canonical team-rating payload.
+- `duplicate_of_run_id`
+- `row_count`, `inserted_row_count`
+- `completed_game_count`: source games using actual final margins as of `run_date`.
+- `projected_game_count`: source games using projected margins.
+- `dropped_game_count`: games skipped because no completed margin, spread, or win probability was available.
+- `home_field_advantage`: solved HFA from the least-squares system.
+- `margin_source`: `completed`, `completed+spread`, `completed+winprob`, `mixed`, etc.
+- `notes`, `error_message`
+
+## Table 4: `public.team_ratings`
+
+One row per team in one successful team-rating run.
+
+Primary key:
+
+- `(team_rating_run_id, team)`
+
+Important columns:
+
+- `team_rating_run_id`
+- `season`, `run_date`, `run_type`
+- `model_version`
+- `team`, `conference`, `classification`
+- `rank`: rank by `team_rating`, best team is 1.
+- `team_rating`: points versus an average FBS team.
+- `power_rating`: same value as `team_rating`, kept for dashboard naming compatibility.
+- `home_field_advantage`: run-level solved HFA repeated on each detail row.
+- `completed_games`, `projected_games`, `total_games`
+- `average_margin_signal`, `average_weighted_margin_signal`: team-perspective source margin summaries.
+- `completed_game_weight`, `projected_game_weight`, `max_margin_signal`: model constants used by the solve.
+- `margin_source`
+- `game_prediction_run_id`
+- `rating_row_hash`
+- `notes`
+
+Latest team ratings:
+
+```sql
+WITH latest_run AS (
+  SELECT team_rating_run_id
+  FROM public.team_rating_runs
+  WHERE season = :season
+    AND run_type IN ('nightly', 'manual')
+    AND status = 'success'
+  ORDER BY created_at DESC
+  LIMIT 1
+)
+SELECT t.*
+FROM public.team_ratings t
+JOIN latest_run r USING (team_rating_run_id)
+ORDER BY t.rank;
+```
+
+## Table 5: `public.ranking_projection_runs`
 
 One row per attempted ranking projection snapshot.
 
@@ -157,7 +237,7 @@ Dashboard/debug use:
 - This is the bridge from rankings to game predictions.
 - If ranking values look strange, check which `game_prediction_run_id` the ranking run used.
 
-## Table 4: `public.ranking_projections_full`
+## Table 6: `public.ranking_projections_full`
 
 One row per team in one successful ranking projection run.
 
@@ -257,7 +337,7 @@ JOIN latest_run lr USING (ranking_projection_run_id)
 ORDER BY r.projected_cfp_ranking NULLS LAST, r.projected_ap_ranking NULLS LAST, r.team;
 ```
 
-## Table 5: `public.season_prediction_runs`
+## Table 7: `public.season_prediction_runs`
 
 One row per attempted season prediction snapshot.
 
@@ -285,7 +365,7 @@ Dashboard/debug use:
 - This is the entry point for season-level team probabilities.
 - Join through `ranking_projection_run_id` if you want to explain which rankings snapshot drove CFP odds.
 
-## Table 6: `public.season_predictions_full`
+## Table 8: `public.season_predictions_full`
 
 One row per team in one successful season prediction run.
 

@@ -70,28 +70,19 @@ jobs:
           SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.nightly_data_updates.update_betting_odds
 
-#      - name: Add ratings for today only
-#        working-directory: etl
-#        env:
-#          PG_DSN: ${{ secrets.PG_DSN }}
-#          # START_SEASON: 2025
-#          # END_SEASON: 2025
-#          ASOF_MIN: ${{ steps.today.outputs.date }}
-#          ASOF_MAX: ${{ steps.today.outputs.date }}
-#        run: python update_team_ratings.py
-
-      # - name: Update game predictions
-      #   env:
-      #     PG_DSN: ${{ secrets.PG_DSN }}
-      #     SEASON: ${{ github.event.inputs.season }}
-      #   run: python -m etl.jobs.prediction_updates.update_game_predictions
-
       - name: Update full game prediction snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
           SEASON: ${{ github.event.inputs.season }}
           GAME_PREDICTION_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
         run: python -m etl.jobs.prediction_updates.update_game_predictions_full
+
+      - name: Update team rating snapshots
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          SEASON: ${{ github.event.inputs.season }}
+          TEAM_RATING_RUN_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prediction_run_type || 'nightly' }}
+        run: python -m etl.jobs.prediction_updates.update_team_ratings_full
 
       - name: Update ranking projection snapshots
         env:
