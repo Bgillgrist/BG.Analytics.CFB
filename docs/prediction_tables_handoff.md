@@ -44,6 +44,13 @@ This matters for dashboard debugging: a season prediction run is tied to a ranki
 
 Team rating runs also tie directly to a game prediction run. They use completed FBS-vs-FBS margins as of the run date plus projected margins from that game prediction snapshot, then solve a weighted SRS-style rating and home-field advantage.
 
+Team rating job controls:
+
+- `TEAM_RATING_RUN_TYPE`: `nightly`, `manual`, or `backfill`.
+- `TEAM_RATING_RUN_DATE`: optional as-of date. Required only when forcing one specific historical date.
+- `TEAM_RATING_GAME_PREDICTION_RUN_ID`: optional explicit upstream game prediction snapshot.
+- `TEAM_RATING_RUN_NOTES`: optional notes stored on the run/detail rows.
+
 ## Run Table Pattern
 
 Each `*_runs` table has the same broad lifecycle:
@@ -166,6 +173,13 @@ Important columns:
 - `margin_source`: `completed`, `completed+spread`, `completed+winprob`, `mixed`, etc.
 - `notes`, `error_message`
 
+Duplicate logic:
+
+- `manual` and `nightly` runs compare against the latest successful run from either type.
+- `backfill` runs compare against the latest successful `backfill` run for the same `run_date`.
+- Duplicate runs store `rating_hash` and `duplicate_of_run_id`, but insert no `team_ratings` detail rows.
+- The hash is based on rating outputs and supporting rating fields, not run metadata or the upstream `game_prediction_run_id`.
+
 ## Table 4: `public.team_ratings`
 
 One row per team in one successful team-rating run.
@@ -208,6 +222,28 @@ SELECT t.*
 FROM public.team_ratings t
 JOIN latest_run r USING (team_rating_run_id)
 ORDER BY t.rank;
+```
+
+Historical team rating movement:
+
+```sql
+SELECT
+  r.run_date,
+  r.created_at AS run_created_at,
+  t.team,
+  t.rank,
+  t.team_rating,
+  t.home_field_advantage,
+  t.completed_games,
+  t.projected_games,
+  t.margin_source
+FROM public.team_rating_runs r
+JOIN public.team_ratings t
+  ON t.team_rating_run_id = r.team_rating_run_id
+WHERE r.season = :season
+  AND r.status = 'success'
+  AND t.team = :team
+ORDER BY r.run_date, r.created_at;
 ```
 
 ## Table 5: `public.ranking_projection_runs`

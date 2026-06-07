@@ -70,6 +70,13 @@ jobs:
           SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.nightly_data_updates.update_betting_odds
 
+      - name: Update transfer portal table
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ github.event.inputs.season }}
+        run: python -m etl.jobs.nightly_data_updates.update_transfer_portal
+
       - name: Update full game prediction snapshots
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
