@@ -1,35 +1,7 @@
 import unittest
-import sys
-import types
+from datetime import date
 
-
-fake_numpy = types.ModuleType("numpy")
-fake_numpy.floating = float
-fake_numpy.integer = int
-fake_numpy.isnan = lambda value: value != value
-sys.modules.setdefault("numpy", fake_numpy)
-sys.modules.setdefault("pandas", types.ModuleType("pandas"))
-sys.modules.setdefault("psycopg", types.ModuleType("psycopg"))
-
-fake_prediction_job = types.ModuleType("etl.jobs.prediction_updates.update_game_predictions")
-fake_prediction_job.BASE_DIFF_FEATURES = []
-fake_prediction_job.FCS_PREDICTION_TYPE = "FCS"
-fake_prediction_job.INCOMPLETE_MODEL_VERSION = "incomplete_2026"
-fake_prediction_job.LINE_AWARE_MODEL_VERSION = "line_aware_2026"
-fake_prediction_job.MODEL_2_EXTRA_DIFF_FEATURES = []
-for name in (
-    "assign_prediction_type",
-    "build_linear_pipeline",
-    "build_logistic_pipeline",
-    "build_modeling_table",
-    "fill_fcs_advanced_inputs_with_baselines",
-    "fill_preseason_inputs_with_second_fbs_averages",
-    "fill_week1_advanced_diffs_with_auxiliary_models",
-    "prediction_records",
-    "score_current_season",
-):
-    setattr(fake_prediction_job, name, lambda *args, **kwargs: None)
-sys.modules.setdefault("etl.jobs.prediction_updates.update_game_predictions", fake_prediction_job)
+import pandas as pd
 
 from etl.jobs.prediction_updates import update_game_predictions_full as job  # noqa: E402
 
@@ -132,6 +104,54 @@ class GamePredictionFullTests(unittest.TestCase):
         self.assertEqual(result, ("existing-run-id", "existing-hash"))
         _, params = conn.cursor_obj.executed[0]
         self.assertEqual(params, (2026, "manual", "nightly"))
+
+    def test_normal_snapshot_keeps_games_not_completed_before_run_date(self):
+        preds = pd.DataFrame(
+            [
+                {
+                    "id": "prior-final",
+                    "gamedate": date(2026, 9, 3),
+                    "homepoints": 31,
+                    "awaypoints": 17,
+                },
+                {
+                    "id": "prior-missing-score",
+                    "gamedate": date(2026, 9, 3),
+                    "homepoints": None,
+                    "awaypoints": None,
+                },
+                {
+                    "id": "same-day-final",
+                    "gamedate": date(2026, 9, 4),
+                    "homepoints": 28,
+                    "awaypoints": 24,
+                },
+                {
+                    "id": "same-day-unplayed",
+                    "gamedate": date(2026, 9, 4),
+                    "homepoints": None,
+                    "awaypoints": None,
+                },
+                {
+                    "id": "future",
+                    "gamedate": date(2026, 9, 5),
+                    "homepoints": None,
+                    "awaypoints": None,
+                },
+            ]
+        )
+
+        filtered = job.filter_predictions_for_run_type(preds, "nightly", date(2026, 9, 4))
+
+        self.assertEqual(
+            filtered["id"].tolist(),
+            [
+                "prior-missing-score",
+                "same-day-final",
+                "same-day-unplayed",
+                "future",
+            ],
+        )
 
     def test_stored_detail_rows_allow_legacy_hash_comparison(self):
         row = (

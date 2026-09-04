@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train game prediction models from Neon data and update public.game_predictions.
+Train XGBoost game prediction models from Neon data and update public.game_predictions.
 """
 
 from __future__ import annotations
@@ -20,115 +20,64 @@ import numpy as np
 import pandas as pd
 from pandas.errors import PerformanceWarning
 import psycopg
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from etl.common_config import load_config
 
 
 warnings.simplefilter("ignore", PerformanceWarning)
 
-LINE_AWARE_MODEL_VERSION = "aware_2026"
-INCOMPLETE_MODEL_VERSION = "incomplete_2026"
-ADVANCED_GAME_KEY_COLS = ["game_id", "season", "season_type", "week", "team", "opponent"]
+XGB_FBS_AWARE_MODEL_VERSION = "xgb_fbs_aware_2026"
+XGB_FBS_INCOMPLETE_MODEL_VERSION = "xgb_fbs_incomplete_2026"
+XGB_FCS_AWARE_MODEL_VERSION = "xgb_fcs_aware_2026"
+XGB_FCS_INCOMPLETE_MODEL_VERSION = "xgb_fcs_incomplete_2026"
+MODEL_VERSION_LABELS = (
+    XGB_FBS_AWARE_MODEL_VERSION,
+    XGB_FBS_INCOMPLETE_MODEL_VERSION,
+    XGB_FCS_AWARE_MODEL_VERSION,
+    XGB_FCS_INCOMPLETE_MODEL_VERSION,
+)
 
-BASE_DIFF_FEATURES = [
-    "recruiting_diff",
-    "talent_diff",
-    "returning_diff",
-    "offense_ppa_prior_avg_diff",
-    "offense_totalppa_prior_avg_diff",
-    "offense_successrate_prior_avg_diff",
-    "offense_explosiveness_prior_avg_diff",
-    "defense_ppa_prior_avg_diff",
-    "defense_totalppa_prior_avg_diff",
-    "defense_successrate_prior_avg_diff",
-    "defense_explosiveness_prior_avg_diff",
-]
+# Kept for downstream imports/tests that reference the older names.
+LINE_AWARE_MODEL_VERSION = XGB_FBS_AWARE_MODEL_VERSION
+INCOMPLETE_MODEL_VERSION = XGB_FBS_INCOMPLETE_MODEL_VERSION
 
-MODEL_2_EXTRA_DIFF_FEATURES = [
-    "offense_stuffrate_prior_avg_diff",
-    "offense_openfieldyardstotal_prior_avg_diff",
-    "offense_standarddowns_ppa_prior_avg_diff",
-    "offense_standarddowns_successrate_prior_avg_diff",
-    "offense_passingdowns_ppa_prior_avg_diff",
-    "offense_passingdowns_successrate_prior_avg_diff",
-    "offense_rushingplays_totalppa_prior_avg_diff",
-    "offense_rushingplays_successrate_prior_avg_diff",
-    "offense_rushingplays_explosiveness_prior_avg_diff",
-    "offense_passingplays_totalppa_prior_avg_diff",
-    "offense_passingplays_explosiveness_prior_avg_diff",
-    "defense_plays_prior_avg_diff",
-    "defense_drives_prior_avg_diff",
-    "defense_powersuccess_prior_avg_diff",
-    "defense_secondlevelyardstotal_prior_avg_diff",
-    "defense_standarddowns_ppa_prior_avg_diff",
-    "defense_passingdowns_successrate_prior_avg_diff",
-    "defense_passingdowns_explosiveness_prior_avg_diff",
-    "defense_rushingplays_ppa_prior_avg_diff",
-    "defense_passingplays_totalppa_prior_avg_diff",
-    "defense_passingplays_explosiveness_prior_avg_diff",
-]
-
-ADVANCED_DIFF_FEATURES = [
-    col
-    for col in BASE_DIFF_FEATURES + MODEL_2_EXTRA_DIFF_FEATURES
-    if col.endswith("_prior_avg_diff")
-]
-ADVANCED_METRICS = [
-    col.replace("_prior_avg_diff", "")
-    for col in ADVANCED_DIFF_FEATURES
-]
-
-PRESEASON_VALUE_COLS = {
-    "recruiting": ("away_recruiting_points", "home_recruiting_points"),
-    "talent": ("away_talent", "home_talent"),
-    "returning": (
-        "away_returning_production_total_ppa",
-        "home_returning_production_total_ppa",
-    ),
-}
-
-PRESEASON_IMPUTER_FEATURES = [
-    "away_recruiting_points",
-    "away_talent",
-    "away_returning_production_total_ppa",
-    "home_recruiting_points",
-    "home_talent",
-    "home_returning_production_total_ppa",
-]
-
-LINE_AWARE_IMPUTER_FEATURES = PRESEASON_IMPUTER_FEATURES + ["avg_spread", "avg_over_under"]
-MIN_AUXILIARY_TRAINING_ROWS = 10
 FCS_PREDICTION_TYPE = "FCS"
 FBS_PREDICTION_TYPE = "FBS"
+RANDOM_STATE = 42
+XGB_N_ESTIMATORS = 500
+
+FBS_BASE_FEATURES = [
+    "home_teamrankings_rating",
+    "away_teamrankings_rating",
+    "home_talent",
+    "away_talent",
+    "home_recruiting_points",
+    "away_recruiting_points",
+    "home_returning_total_ppa",
+    "away_returning_total_ppa",
+    "home_returning_percent_ppa",
+    "away_returning_percent_ppa",
+    "neutral_site",
+]
+FBS_SPREAD_FEATURES = ["avg_spread"] + FBS_BASE_FEATURES
+FBS_TOTAL_FEATURES = ["avg_over_under"] + FBS_BASE_FEATURES
+
+FCS_BASE_FEATURES = [
+    "fbs_teamrankings_rating",
+    "fbs_talent",
+    "fbs_recruiting_points",
+    "fbs_returning_total_ppa",
+    "fbs_returning_percent_ppa",
+    "fbs_is_home",
+    "neutral_site",
+    "is_fcs_game",
+]
+FCS_SPREAD_FEATURES = ["fbs_spread"] + FCS_BASE_FEATURES
+FCS_TOTAL_FEATURES = ["avg_over_under"] + FCS_BASE_FEATURES
 
 
 def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
-    prior_select_sql = ",\n        ".join(
-        f"""
-        AVG(t.{metric}) OVER (
-          PARTITION BY t.season, t.team
-          ORDER BY t.phase_order, t.gamedate, t.game_id
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-        ) AS {metric}_prior_avg""".strip()
-        for metric in ADVANCED_METRICS
-    )
-    advanced_base_cols_sql = ",\n          ".join(f"tags.{metric}" for metric in ADVANCED_METRICS)
-    away_prior_select_sql = ",\n      ".join(
-        f"aasp.{metric}_prior_avg AS away_{metric}_prior_avg,\n"
-        f"      hasp.{metric}_prior_avg AS home_{metric}_prior_avg"
-        for metric in ADVANCED_METRICS
-    )
-    away_actual_select_sql = ",\n      ".join(
-        f"aactual.{metric} AS away_{metric}_actual,\n"
-        f"      hactual.{metric} AS home_{metric}_actual"
-        for metric in ADVANCED_METRICS
-    )
-
-    sql = f"""
+    sql = """
     WITH g AS (
       SELECT
         id,
@@ -152,22 +101,6 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
         )
         AND startdate IS NOT NULL
     ),
-    fbs_team_seasons AS (
-      SELECT hometeam AS team, season
-      FROM public.game_data
-      WHERE LOWER(homeclassification) = 'fbs'
-        AND hometeam IS NOT NULL
-      UNION
-      SELECT awayteam AS team, season
-      FROM public.game_data
-      WHERE LOWER(awayclassification) = 'fbs'
-        AND awayteam IS NOT NULL
-    ),
-    first_fbs_seasons AS (
-      SELECT team, MIN(season) AS first_fbs_season
-      FROM fbs_team_seasons
-      GROUP BY team
-    ),
     odds AS (
       SELECT
         CAST("Id" AS BIGINT) AS id,
@@ -175,123 +108,73 @@ def build_modeling_table(conn, max_season: int) -> pd.DataFrame:
         AVG("OverUnder") AS avg_over_under
       FROM public.betting_odds
       GROUP BY 1
-    ),
-    advanced_base AS (
-      SELECT
-        tags.game_id,
-        tags.season,
-        tags.team,
-        CAST(gd_adv.startdate AS date) AS gamedate,
-        CASE
-          WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'regular' THEN 1
-          WHEN LOWER(COALESCE(tags.season_type, gd_adv.seasontype)) = 'postseason' THEN 2
-          ELSE 3
-        END AS phase_order,
-        {advanced_base_cols_sql}
-      FROM public.team_advanced_game_stats tags
-      INNER JOIN public.game_data gd_adv
-        ON gd_adv.id = tags.game_id
-      WHERE tags.season BETWEEN 2015 AND %s
-        AND gd_adv.startdate IS NOT NULL
-    ),
-    advanced_stats_prior AS (
-      SELECT
-        t.game_id,
-        t.team,
-        {prior_select_sql}
-      FROM advanced_base t
     )
     SELECT
       g.*,
       o.avg_spread,
       o.avg_over_under,
-      afs.first_fbs_season AS away_first_fbs_season,
-      hfs.first_fbs_season AS home_first_fbs_season,
-      arr.points AS away_recruiting_points,
       hrr.points AS home_recruiting_points,
-      atc.talent AS away_talent,
+      arr.points AS away_recruiting_points,
       htc.talent AS home_talent,
-      arp.total_ppa AS away_returning_production_total_ppa,
-      hrp.total_ppa AS home_returning_production_total_ppa,
-      {away_prior_select_sql},
-      {away_actual_select_sql}
+      atc.talent AS away_talent,
+      hrp.total_ppa AS home_returning_total_ppa,
+      arp.total_ppa AS away_returning_total_ppa,
+      hrp.percent_ppa AS home_returning_percent_ppa,
+      arp.percent_ppa AS away_returning_percent_ppa,
+      hrp.usage AS home_returning_usage,
+      arp.usage AS away_returning_usage,
+      htr.pull_date AS home_teamrankings_pull_date,
+      atr.pull_date AS away_teamrankings_pull_date,
+      htr.rank AS home_teamrankings_rank,
+      atr.rank AS away_teamrankings_rank,
+      htr.rating AS home_teamrankings_rating,
+      atr.rating AS away_teamrankings_rating
     FROM g
     LEFT JOIN odds o
       ON o.id = g.id
-    LEFT JOIN first_fbs_seasons afs
-      ON afs.team = g.awayteam
-    LEFT JOIN first_fbs_seasons hfs
-      ON hfs.team = g.hometeam
-    LEFT JOIN public.team_recruiting_rankings arr
-      ON arr.team = g.awayteam
-     AND arr.year = g.season
     LEFT JOIN public.team_recruiting_rankings hrr
       ON hrr.team = g.hometeam
      AND hrr.year = g.season
-    LEFT JOIN public.team_talent_composite atc
-      ON atc.team = g.awayteam
-     AND atc.year = g.season
+    LEFT JOIN public.team_recruiting_rankings arr
+      ON arr.team = g.awayteam
+     AND arr.year = g.season
     LEFT JOIN public.team_talent_composite htc
       ON htc.team = g.hometeam
      AND htc.year = g.season
-    LEFT JOIN public.team_returning_production arp
-      ON arp.team = g.awayteam
-     AND arp.season = g.season
+    LEFT JOIN public.team_talent_composite atc
+      ON atc.team = g.awayteam
+     AND atc.year = g.season
     LEFT JOIN public.team_returning_production hrp
       ON hrp.team = g.hometeam
      AND hrp.season = g.season
-    LEFT JOIN advanced_stats_prior aasp
-      ON aasp.game_id = g.id
-     AND aasp.team = g.awayteam
-    LEFT JOIN advanced_stats_prior hasp
-      ON hasp.game_id = g.id
-     AND hasp.team = g.hometeam
-    LEFT JOIN advanced_base aactual
-      ON aactual.game_id = g.id
-     AND aactual.team = g.awayteam
-    LEFT JOIN advanced_base hactual
-      ON hactual.game_id = g.id
-     AND hactual.team = g.hometeam
+    LEFT JOIN public.team_returning_production arp
+      ON arp.team = g.awayteam
+     AND arp.season = g.season
+    LEFT JOIN LATERAL (
+      SELECT pull_date, rank, rating
+      FROM public.teamrankings_predictive_ratings tr
+      WHERE tr.season = g.season
+        AND tr.team = g.hometeam
+        AND tr.pull_date < g.gamedate
+      ORDER BY tr.pull_date DESC
+      LIMIT 1
+    ) htr ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT pull_date, rank, rating
+      FROM public.teamrankings_predictive_ratings tr
+      WHERE tr.season = g.season
+        AND tr.team = g.awayteam
+        AND tr.pull_date < g.gamedate
+      ORDER BY tr.pull_date DESC
+      LIMIT 1
+    ) atr ON TRUE
     ORDER BY g.season, g.week, g.gamedate, g.id
     """
 
-    df = pd.read_sql(sql, conn, params=(max_season, max_season))
+    df = pd.read_sql(sql, conn, params=(max_season,))
     if df.empty:
         raise RuntimeError("Modeling query returned no rows.")
-
-    diff_pairs = {
-        "recruiting_diff": ("away_recruiting_points", "home_recruiting_points"),
-        "talent_diff": ("away_talent", "home_talent"),
-        "returning_diff": (
-            "away_returning_production_total_ppa",
-            "home_returning_production_total_ppa",
-        ),
-    }
-    for metric in ADVANCED_METRICS:
-        diff_pairs[f"{metric}_prior_avg_diff"] = (
-            f"away_{metric}_prior_avg",
-            f"home_{metric}_prior_avg",
-        )
-        diff_pairs[f"{metric}_game_diff"] = (
-            f"away_{metric}_actual",
-            f"home_{metric}_actual",
-        )
-
-    for diff_col, (away_col, home_col) in diff_pairs.items():
-        df[diff_col] = (
-            pd.to_numeric(df.get(away_col), errors="coerce")
-            - pd.to_numeric(df.get(home_col), errors="coerce")
-        )
-
     return df
-
-
-def recompute_preseason_diffs(df: pd.DataFrame) -> None:
-    for metric, (away_col, home_col) in PRESEASON_VALUE_COLS.items():
-        df[f"{metric}_diff"] = (
-            pd.to_numeric(df[away_col], errors="coerce")
-            - pd.to_numeric(df[home_col], errors="coerce")
-        )
 
 
 def normalized_classification(df: pd.DataFrame, col: str) -> pd.Series:
@@ -308,379 +191,355 @@ def assign_prediction_type(df: pd.DataFrame) -> None:
     df["prediction_type"] = np.where(is_fcs_game, FCS_PREDICTION_TYPE, FBS_PREDICTION_TYPE)
 
 
-def fcs_advanced_baseline_quantile(metric: str) -> float:
-    if metric.startswith("defense_") or metric == "offense_stuffrate":
-        return 0.95
-    return 0.05
+def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce")
 
 
-def recompute_advanced_diffs(df: pd.DataFrame) -> None:
-    for feature_col in ADVANCED_DIFF_FEATURES:
-        metric = feature_col.replace("_prior_avg_diff", "")
-        away_col = f"away_{metric}_prior_avg"
-        home_col = f"home_{metric}_prior_avg"
-        if away_col not in df.columns:
-            df[away_col] = np.nan
-        if home_col not in df.columns:
-            df[home_col] = np.nan
-        df[feature_col] = (
-            pd.to_numeric(df[away_col], errors="coerce")
-            - pd.to_numeric(df[home_col], errors="coerce")
+def _indicator_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(0, index=df.index, dtype="int64")
+    raw = df[col]
+    if pd.api.types.is_bool_dtype(raw):
+        return raw.fillna(False).astype(int)
+    text = raw.fillna("").astype(str).str.strip().str.lower()
+    truthy = text.isin({"true", "t", "1", "yes", "y"})
+    numeric = pd.to_numeric(raw, errors="coerce").fillna(0).ne(0)
+    return (truthy | numeric).astype(int)
+
+
+def prepare_modeling_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    assign_prediction_type(df)
+
+    home_class = normalized_classification(df, "homeclassification")
+    away_class = normalized_classification(df, "awayclassification")
+    fbs_home = home_class.eq("fbs") & away_class.eq("fcs")
+    fbs_away = away_class.eq("fbs") & home_class.eq("fcs")
+
+    df["has_spread_line"] = _numeric_series(df, "avg_spread").notna()
+    df["has_total_line"] = _numeric_series(df, "avg_over_under").notna()
+    df["neutral_site"] = _indicator_series(df, "neutralsite")
+    df["is_fcs_game"] = df["prediction_type"].eq(FCS_PREDICTION_TYPE).astype(int)
+    df["fbs_is_home"] = fbs_home.astype(int)
+
+    numeric_cols = sorted(
+        set(
+            FBS_SPREAD_FEATURES
+            + FBS_TOTAL_FEATURES
+            + FCS_SPREAD_FEATURES
+            + FCS_TOTAL_FEATURES
+            + [
+                "homepoints",
+                "awaypoints",
+                "home_teamrankings_rank",
+                "away_teamrankings_rank",
+                "home_returning_usage",
+                "away_returning_usage",
+            ]
         )
-
-
-def fill_preseason_inputs_with_second_fbs_averages(
-    df: pd.DataFrame,
-    current_season: int,
-) -> None:
-    team_frames = []
-    side_specs = [
-        (
-            "away",
-            "awayteam",
-            "awayclassification",
-            "away_first_fbs_season",
-            {
-                "recruiting": "away_recruiting_points",
-                "talent": "away_talent",
-                "returning": "away_returning_production_total_ppa",
-            },
-        ),
-        (
-            "home",
-            "hometeam",
-            "homeclassification",
-            "home_first_fbs_season",
-            {
-                "recruiting": "home_recruiting_points",
-                "talent": "home_talent",
-                "returning": "home_returning_production_total_ppa",
-            },
-        ),
-    ]
-
-    for _, team_col, class_col, first_fbs_col, value_cols in side_specs:
-        frame = df[
-            ["season", team_col, class_col, first_fbs_col] + list(value_cols.values())
-        ].rename(
-            columns={
-                team_col: "team",
-                class_col: "classification",
-                first_fbs_col: "first_fbs_season",
-                **{col: metric for metric, col in value_cols.items()},
-            }
-        )
-        team_frames.append(frame)
-
-    team_seasons = (
-        pd.concat(team_frames, ignore_index=True)
-        .dropna(subset=["team", "season"])
-        .drop_duplicates(subset=["team", "season"])
     )
-    for metric in PRESEASON_VALUE_COLS:
-        team_seasons[metric] = pd.to_numeric(team_seasons[metric], errors="coerce")
+    for col in numeric_cols:
+        if col not in {"neutral_site", "is_fcs_game", "fbs_is_home"}:
+            df[col] = _numeric_series(df, col)
 
-    historical = team_seasons[
-        (pd.to_numeric(team_seasons["season"], errors="coerce") < current_season)
-        & team_seasons["classification"].fillna("").astype(str).str.lower().eq("fbs")
-    ]
-    second_fbs_historical = historical[
-        pd.to_numeric(historical["season"], errors="coerce")
-        == pd.to_numeric(historical["first_fbs_season"], errors="coerce") + 1
-    ]
-    fill_values = (
-        second_fbs_historical[list(PRESEASON_VALUE_COLS.keys())]
-        .mean()
-        .fillna(historical[list(PRESEASON_VALUE_COLS.keys())].mean())
-        .fillna(0.0)
+    df["fbs_teamrankings_rating"] = np.where(
+        fbs_home,
+        df["home_teamrankings_rating"],
+        np.where(fbs_away, df["away_teamrankings_rating"], np.nan),
     )
-    fcs_fill_values = {
-        "recruiting": 0.0,
-        "talent": 0.0,
-        "returning": float(historical["returning"].quantile(0.10))
-        if historical["returning"].notna().any()
-        else 0.0,
-    }
-    historical_by_team = historical.sort_values(["team", "season"])
-    latest_historical_values = {
-        metric: historical_by_team.dropna(subset=[metric]).groupby("team")[metric].last()
-        for metric in PRESEASON_VALUE_COLS
-    }
+    df["fbs_talent"] = np.where(
+        fbs_home,
+        df["home_talent"],
+        np.where(fbs_away, df["away_talent"], np.nan),
+    )
+    df["fbs_recruiting_points"] = np.where(
+        fbs_home,
+        df["home_recruiting_points"],
+        np.where(fbs_away, df["away_recruiting_points"], np.nan),
+    )
+    df["fbs_returning_total_ppa"] = np.where(
+        fbs_home,
+        df["home_returning_total_ppa"],
+        np.where(fbs_away, df["away_returning_total_ppa"], np.nan),
+    )
+    df["fbs_returning_percent_ppa"] = np.where(
+        fbs_home,
+        df["home_returning_percent_ppa"],
+        np.where(fbs_away, df["away_returning_percent_ppa"], np.nan),
+    )
+    df["fbs_spread"] = np.where(
+        fbs_home,
+        df["avg_spread"],
+        np.where(fbs_away, -df["avg_spread"], np.nan),
+    )
 
-    season_numeric = pd.to_numeric(df["season"], errors="coerce")
-    for _, team_col, class_col, _, value_cols in side_specs:
-        class_lower = normalized_classification(df, class_col)
-        for metric, col in value_cols.items():
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            current_fbs_missing = (
-                df[col].isna()
-                & class_lower.eq("fbs")
-                & season_numeric.eq(current_season)
-            )
-            if current_fbs_missing.any():
-                df.loc[current_fbs_missing, col] = df.loc[current_fbs_missing, team_col].map(
-                    latest_historical_values[metric]
-                )
-            fbs_missing = df[col].isna() & class_lower.eq("fbs")
-            df.loc[fbs_missing, col] = float(fill_values[metric])
-            df.loc[class_lower.eq("fcs"), col] = float(fcs_fill_values[metric])
+    home_points = _numeric_series(df, "homepoints")
+    away_points = _numeric_series(df, "awaypoints")
+    df["spread_target"] = home_points - away_points
+    df["win_target"] = (home_points > away_points).where(home_points.notna() & away_points.notna())
+    df["total_points_target"] = home_points + away_points
+    df["fbs_points"] = np.where(fbs_home, home_points, np.where(fbs_away, away_points, np.nan))
+    df["fcs_points"] = np.where(fbs_home, away_points, np.where(fbs_away, home_points, np.nan))
+    df["fbs_margin_target"] = df["fbs_points"] - df["fcs_points"]
+    df["fbs_win_target"] = (
+        pd.Series(df["fbs_points"], index=df.index)
+        > pd.Series(df["fcs_points"], index=df.index)
+    ).where(pd.notna(df["fbs_points"]) & pd.notna(df["fcs_points"]))
 
-    recompute_preseason_diffs(df)
-
-
-def fill_fcs_advanced_inputs_with_baselines(
-    df: pd.DataFrame,
-    current_season: int,
-) -> None:
-    season_numeric = pd.to_numeric(df["season"], errors="coerce")
-    historical_mask = season_numeric.lt(current_season)
-
-    for feature_col in ADVANCED_DIFF_FEATURES:
-        metric = feature_col.replace("_prior_avg_diff", "")
-        side_values = []
-        for side in ["away", "home"]:
-            class_col = f"{side}classification"
-            value_col = f"{side}_{metric}_prior_avg"
-            if value_col not in df.columns:
-                df[value_col] = np.nan
-            fbs_mask = historical_mask & normalized_classification(df, class_col).eq("fbs")
-            side_values.append(pd.to_numeric(df.loc[fbs_mask, value_col], errors="coerce"))
-
-        historical_values = pd.concat(side_values).dropna()
-        quantile = fcs_advanced_baseline_quantile(metric)
-        baseline = float(historical_values.quantile(quantile)) if not historical_values.empty else 0.0
-
-        for side in ["away", "home"]:
-            class_col = f"{side}classification"
-            value_col = f"{side}_{metric}_prior_avg"
-            df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-            df.loc[normalized_classification(df, class_col).eq("fcs"), value_col] = baseline
-
-    recompute_advanced_diffs(df)
+    return df
 
 
-def advanced_feature_target_col(feature_col: str) -> str:
-    return feature_col.replace("_prior_avg_diff", "_game_diff")
+def _xgboost_classes():
+    try:
+        from xgboost import XGBClassifier, XGBRegressor
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to import xgboost. Install the Python package from etl/requirements.txt; "
+            "on macOS you may also need `brew install libomp` so libxgboost can load."
+        ) from exc
+    return XGBClassifier, XGBRegressor
 
 
-def build_linear_pipeline(feature_cols: list[str]) -> Pipeline:
-    preprocess = ColumnTransformer(transformers=[("num", StandardScaler(), feature_cols)])
-    return Pipeline(steps=[("preprocess", preprocess), ("linreg", LinearRegression())])
-
-
-def build_logistic_pipeline(feature_cols: list[str]) -> Pipeline:
-    preprocess = ColumnTransformer(transformers=[("num", StandardScaler(), feature_cols)])
-    return Pipeline(
-        steps=[
-            ("preprocess", preprocess),
-            ("logreg", LogisticRegression(max_iter=1000, solver="lbfgs")),
-        ]
+def build_xgb_classifier():
+    XGBClassifier, _ = _xgboost_classes()
+    return XGBClassifier(
+        n_estimators=XGB_N_ESTIMATORS,
+        max_depth=3,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
     )
 
 
-def predict_auxiliary_values(
-    df: pd.DataFrame,
-    fit_mask: pd.Series,
-    predict_mask: pd.Series,
+def build_xgb_regressor():
+    _, XGBRegressor = _xgboost_classes()
+    return XGBRegressor(
+        n_estimators=XGB_N_ESTIMATORS,
+        max_depth=3,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        objective="reg:squarederror",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+
+
+def _training_frame(
+    train_df: pd.DataFrame,
     feature_cols: list[str],
     target_col: str,
+    label: str,
+) -> pd.DataFrame:
+    model_df = train_df[feature_cols + [target_col]].copy()
+    model_df = model_df[model_df[target_col].notna()]
+    if model_df.empty:
+        raise RuntimeError(f"No completed training rows available for {label}.")
+    return model_df
+
+
+def _fit_classifier(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    label: str,
 ):
-    if not predict_mask.any():
-        return None
-
-    fit_cols = feature_cols + [target_col]
-    fit_df = df.loc[fit_mask, fit_cols].copy()
-    for col in fit_cols:
-        fit_df[col] = pd.to_numeric(fit_df[col], errors="coerce")
-    fit_df = fit_df.dropna()
-    if len(fit_df) < MIN_AUXILIARY_TRAINING_ROWS:
-        return None
-
-    predict_df = df.loc[predict_mask, feature_cols].copy()
-    for col in feature_cols:
-        predict_df[col] = pd.to_numeric(predict_df[col], errors="coerce")
-    predict_df = predict_df.fillna(0.0)
-
-    model = build_linear_pipeline(feature_cols)
-    model.fit(fit_df[feature_cols], fit_df[target_col].astype(float))
-    return pd.Series(model.predict(predict_df[feature_cols]), index=predict_df.index)
+    model_df = _training_frame(train_df, feature_cols, target_col, label)
+    y = model_df[target_col].astype(int)
+    if y.nunique() < 2:
+        raise RuntimeError(f"{label} has only one target class; cannot train classifier.")
+    print(f"Training {label} on {len(model_df)} rows...")
+    model = build_xgb_classifier()
+    model.fit(model_df[feature_cols], y)
+    return model
 
 
-def fill_week1_advanced_diffs_with_auxiliary_models(
+def _fit_regressor(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    label: str,
+):
+    model_df = _training_frame(train_df, feature_cols, target_col, label)
+    print(f"Training {label} on {len(model_df)} rows...")
+    model = build_xgb_regressor()
+    model.fit(model_df[feature_cols], model_df[target_col].astype(float))
+    return model
+
+
+def train_models_for_mask(
     df: pd.DataFrame,
     current_season: int,
-) -> None:
-    for col in PRESEASON_IMPUTER_FEATURES + ["avg_spread", "avg_over_under"]:
-        if col not in df.columns:
-            df[col] = np.nan
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    train_mask: pd.Series,
+    training_message: str | None = None,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    modeled_df = prepare_modeling_dataframe(df)
+    completed = modeled_df["homepoints"].notna() & modeled_df["awaypoints"].notna()
+    train_df = modeled_df[train_mask & completed].copy()
+    if train_df.empty:
+        raise RuntimeError("No completed games available for model training.")
 
-    df["_week_numeric"] = pd.to_numeric(df["week"], errors="coerce")
-    df["_season_numeric"] = pd.to_numeric(df["season"], errors="coerce")
-    df["_has_both_lines"] = df["avg_spread"].notna() & df["avg_over_under"].notna()
+    if training_message:
+        print(training_message)
 
-    seasons = sorted(
-        int(s)
-        for s in df["_season_numeric"].dropna().unique().tolist()
-        if int(s) <= current_season
-    )
-    for feature_col in ADVANCED_DIFF_FEATURES:
-        target_col = advanced_feature_target_col(feature_col)
-        if target_col not in df.columns:
-            continue
+    fbs_train = train_df[train_df["prediction_type"].eq(FBS_PREDICTION_TYPE)].copy()
+    fcs_train = train_df[train_df["prediction_type"].eq(FCS_PREDICTION_TYPE)].copy()
+    if fbs_train.empty:
+        raise RuntimeError("No completed FBS-vs-FBS games available for model training.")
+    if fcs_train.empty:
+        raise RuntimeError("No completed FBS-vs-FCS games available for model training.")
 
-        df[feature_col] = pd.to_numeric(df[feature_col], errors="coerce")
-        df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+    fbs_spread_train = fbs_train[fbs_train["has_spread_line"]].copy()
+    fbs_total_train = fbs_train[fbs_train["has_total_line"]].copy()
+    fcs_spread_train = fcs_train[fcs_train["has_spread_line"]].copy()
+    fcs_total_train = fcs_train[fcs_train["has_total_line"]].copy()
+    if fbs_spread_train.empty:
+        raise RuntimeError("No FBS-vs-FBS games with spread data available.")
+    if fbs_total_train.empty:
+        raise RuntimeError("No FBS-vs-FBS games with total-line data available.")
+    if fcs_spread_train.empty:
+        raise RuntimeError("No FBS-vs-FCS games with spread data available.")
+    if fcs_total_train.empty:
+        raise RuntimeError("No FBS-vs-FCS games with total-line data available.")
 
-        for season in seasons:
-            prediction_mask = (
-                df["_season_numeric"].eq(season)
-                & df["_week_numeric"].eq(1)
-                & df[feature_col].isna()
-            )
-            if not prediction_mask.any():
-                continue
+    model_bundle = {
+        "fbs_win_with_spread": _fit_classifier(
+            fbs_spread_train, FBS_SPREAD_FEATURES, "win_target", "FBS win XGBoost with spread"
+        ),
+        "fbs_win_no_spread": _fit_classifier(
+            fbs_train, FBS_BASE_FEATURES, "win_target", "FBS win XGBoost without spread"
+        ),
+        "fbs_spread_with_spread": _fit_regressor(
+            fbs_spread_train, FBS_SPREAD_FEATURES, "spread_target", "FBS spread XGBoost with spread"
+        ),
+        "fbs_spread_no_spread": _fit_regressor(
+            fbs_train, FBS_BASE_FEATURES, "spread_target", "FBS spread XGBoost without spread"
+        ),
+        "fbs_total_with_total": _fit_regressor(
+            fbs_total_train, FBS_TOTAL_FEATURES, "total_points_target", "FBS total XGBoost with total"
+        ),
+        "fbs_total_no_total": _fit_regressor(
+            fbs_train, FBS_BASE_FEATURES, "total_points_target", "FBS total XGBoost without total"
+        ),
+        "fcs_win_with_spread": _fit_classifier(
+            fcs_spread_train, FCS_SPREAD_FEATURES, "fbs_win_target", "FCS win XGBoost with spread"
+        ),
+        "fcs_win_no_spread": _fit_classifier(
+            fcs_train, FCS_BASE_FEATURES, "fbs_win_target", "FCS win XGBoost without spread"
+        ),
+        "fcs_margin_with_spread": _fit_regressor(
+            fcs_spread_train, FCS_SPREAD_FEATURES, "fbs_margin_target", "FCS margin XGBoost with spread"
+        ),
+        "fcs_margin_no_spread": _fit_regressor(
+            fcs_train, FCS_BASE_FEATURES, "fbs_margin_target", "FCS margin XGBoost without spread"
+        ),
+        "fcs_total_with_total": _fit_regressor(
+            fcs_total_train, FCS_TOTAL_FEATURES, "total_points_target", "FCS total XGBoost with total"
+        ),
+        "fcs_total_no_total": _fit_regressor(
+            fcs_train, FCS_BASE_FEATURES, "total_points_target", "FCS total XGBoost without total"
+        ),
+    }
 
-            historical_week1_mask = (
-                df["_season_numeric"].lt(season)
-                & df["_week_numeric"].eq(1)
-                & df[target_col].notna()
-            )
-            if not historical_week1_mask.any():
-                continue
-
-            line_prediction_mask = prediction_mask & df["_has_both_lines"]
-            fallback_prediction_mask = prediction_mask & ~df["_has_both_lines"]
-
-            line_predictions = predict_auxiliary_values(
-                df,
-                historical_week1_mask & df["_has_both_lines"],
-                line_prediction_mask,
-                LINE_AWARE_IMPUTER_FEATURES,
-                target_col,
-            )
-            if line_predictions is None:
-                line_predictions = predict_auxiliary_values(
-                    df,
-                    historical_week1_mask,
-                    line_prediction_mask,
-                    PRESEASON_IMPUTER_FEATURES,
-                    target_col,
-                )
-
-            fallback_predictions = predict_auxiliary_values(
-                df,
-                historical_week1_mask,
-                fallback_prediction_mask,
-                PRESEASON_IMPUTER_FEATURES,
-                target_col,
-            )
-
-            for predictions in [line_predictions, fallback_predictions]:
-                if predictions is not None:
-                    df.loc[predictions.index, feature_col] = predictions
-
-    df.drop(columns=["_week_numeric", "_season_numeric", "_has_both_lines"], inplace=True)
+    modeled_df.attrs["fbs_spread_features"] = FBS_SPREAD_FEATURES
+    modeled_df.attrs["fbs_base_features"] = FBS_BASE_FEATURES
+    modeled_df.attrs["fbs_total_features"] = FBS_TOTAL_FEATURES
+    modeled_df.attrs["fcs_spread_features"] = FCS_SPREAD_FEATURES
+    modeled_df.attrs["fcs_base_features"] = FCS_BASE_FEATURES
+    modeled_df.attrs["fcs_total_features"] = FCS_TOTAL_FEATURES
+    return model_bundle, modeled_df
 
 
 def train_models(df: pd.DataFrame, current_season: int):
-    df = df.copy()
-    assign_prediction_type(df)
-    df["has_spread_line"] = df["avg_spread"].notna() if "avg_spread" in df.columns else False
-    df["has_total_line"] = df["avg_over_under"].notna() if "avg_over_under" in df.columns else False
-
-    fill_preseason_inputs_with_second_fbs_averages(df, current_season)
-    fill_fcs_advanced_inputs_with_baselines(df, current_season)
-    fill_week1_advanced_diffs_with_auxiliary_models(df, current_season)
-
-    model_1_spread_features = ["avg_spread"] + BASE_DIFF_FEATURES
-    model_1_total_features = ["avg_over_under"] + BASE_DIFF_FEATURES
-    model_2_features = BASE_DIFF_FEATURES + MODEL_2_EXTRA_DIFF_FEATURES
-    model_numeric_cols = sorted(
-        set(model_1_spread_features + model_1_total_features + model_2_features)
+    season_numeric = pd.to_numeric(df["season"], errors="coerce")
+    train_mask = season_numeric.lt(current_season)
+    return train_models_for_mask(
+        df,
+        current_season,
+        train_mask,
+        training_message=f"Training on completed seasons before {current_season}.",
     )
 
-    for col in model_numeric_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    df["spread_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        - pd.to_numeric(df["awaypoints"], errors="coerce")
-    )
-    df["win_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        > pd.to_numeric(df["awaypoints"], errors="coerce")
-    ).astype(float)
-    df["total_points_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        + pd.to_numeric(df["awaypoints"], errors="coerce")
-    )
+def _predict_probability(model, frame: pd.DataFrame, feature_cols: list[str]) -> np.ndarray:
+    return model.predict_proba(frame[feature_cols])[:, 1]
 
-    train_df = df[
-        (pd.to_numeric(df["season"], errors="coerce") < current_season)
-        & df["homepoints"].notna()
-        & df["awaypoints"].notna()
-    ].copy()
-    if train_df.empty:
-        raise RuntimeError("No completed historical games available for model training.")
 
-    train_df_spread_line = train_df[train_df["has_spread_line"]].copy()
-    train_df_total_line = train_df[train_df["has_total_line"]].copy()
-    if train_df_spread_line.empty:
-        raise RuntimeError("No historical games with spread data available for line-aware win/spread models.")
-    if train_df_total_line.empty:
-        raise RuntimeError("No historical games with total-line data available for line-aware total model.")
+def _score_fbs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bundle: dict) -> None:
+    fbs_mask = current_df["prediction_type"].eq(FBS_PREDICTION_TYPE)
+    spread_mask = fbs_mask & current_df["has_spread_line"].astype(bool)
+    no_spread_mask = fbs_mask & ~current_df["has_spread_line"].astype(bool)
+    total_mask = fbs_mask & current_df["has_total_line"].astype(bool)
+    no_total_mask = fbs_mask & ~current_df["has_total_line"].astype(bool)
 
-    model_bundle = {
-        "win_line": build_logistic_pipeline(model_1_spread_features),
-        "spread_line": build_linear_pipeline(model_1_spread_features),
-        "total_line": build_linear_pipeline(model_1_total_features),
-        "win_model_2": build_logistic_pipeline(model_2_features),
-        "spread_model_2": build_linear_pipeline(model_2_features),
-        "total_model_2": build_linear_pipeline(model_2_features),
-    }
+    for mask, win_model, spread_model, feature_key in [
+        (spread_mask, "fbs_win_with_spread", "fbs_spread_with_spread", "fbs_spread_features"),
+        (no_spread_mask, "fbs_win_no_spread", "fbs_spread_no_spread", "fbs_base_features"),
+    ]:
+        if not mask.any():
+            continue
+        features = modeled_df.attrs[feature_key]
+        frame = current_df.loc[mask, features]
+        home_prob = _predict_probability(model_bundle[win_model], current_df.loc[mask], features)
+        home_margin = model_bundle[spread_model].predict(frame)
+        current_df.loc[mask, "homewinprob"] = home_prob
+        current_df.loc[mask, "awaywinprob"] = 1.0 - home_prob
+        current_df.loc[mask, "homespread"] = -home_margin
+        current_df.loc[mask, "awayspread"] = home_margin
 
-    print(f"Training WIN model (line-aware) on {len(train_df_spread_line)} rows...")
-    model_bundle["win_line"].fit(
-        train_df_spread_line[model_1_spread_features],
-        train_df_spread_line["win_target"].astype(int),
-    )
-    print(f"Training SPREAD model (line-aware) on {len(train_df_spread_line)} rows...")
-    model_bundle["spread_line"].fit(
-        train_df_spread_line[model_1_spread_features],
-        train_df_spread_line["spread_target"].astype(float),
-    )
-    print(f"Training TOTAL model (line-aware) on {len(train_df_total_line)} rows...")
-    model_bundle["total_line"].fit(
-        train_df_total_line[model_1_total_features],
-        train_df_total_line["total_points_target"].astype(float),
-    )
+    for mask, total_model, feature_key in [
+        (total_mask, "fbs_total_with_total", "fbs_total_features"),
+        (no_total_mask, "fbs_total_no_total", "fbs_base_features"),
+    ]:
+        if not mask.any():
+            continue
+        features = modeled_df.attrs[feature_key]
+        current_df.loc[mask, "totalpred"] = model_bundle[total_model].predict(
+            current_df.loc[mask, features]
+        )
 
-    print(f"Training WIN model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["win_model_2"].fit(
-        train_df[model_2_features],
-        train_df["win_target"].astype(int),
-    )
-    print(f"Training SPREAD model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["spread_model_2"].fit(
-        train_df[model_2_features],
-        train_df["spread_target"].astype(float),
-    )
-    print(f"Training TOTAL model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["total_model_2"].fit(
-        train_df[model_2_features],
-        train_df["total_points_target"].astype(float),
-    )
 
-    df.attrs["win_line_features"] = model_1_spread_features
-    df.attrs["spread_line_features"] = model_1_spread_features
-    df.attrs["total_line_features"] = model_1_total_features
-    df.attrs["win_model_2_features"] = model_2_features
-    df.attrs["spread_model_2_features"] = model_2_features
-    df.attrs["total_model_2_features"] = model_2_features
-    return model_bundle, df
+def _score_fcs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bundle: dict) -> None:
+    fcs_mask = current_df["prediction_type"].eq(FCS_PREDICTION_TYPE)
+    spread_mask = fcs_mask & current_df["has_spread_line"].astype(bool)
+    no_spread_mask = fcs_mask & ~current_df["has_spread_line"].astype(bool)
+    total_mask = fcs_mask & current_df["has_total_line"].astype(bool)
+    no_total_mask = fcs_mask & ~current_df["has_total_line"].astype(bool)
+
+    for mask, win_model, margin_model, feature_key in [
+        (spread_mask, "fcs_win_with_spread", "fcs_margin_with_spread", "fcs_spread_features"),
+        (no_spread_mask, "fcs_win_no_spread", "fcs_margin_no_spread", "fcs_base_features"),
+    ]:
+        if not mask.any():
+            continue
+        features = modeled_df.attrs[feature_key]
+        fbs_prob = _predict_probability(model_bundle[win_model], current_df.loc[mask], features)
+        fbs_margin = model_bundle[margin_model].predict(current_df.loc[mask, features])
+        fbs_home = current_df.loc[mask, "fbs_is_home"].astype(bool)
+
+        current_df.loc[mask, "homewinprob"] = np.where(fbs_home, fbs_prob, 1.0 - fbs_prob)
+        current_df.loc[mask, "awaywinprob"] = 1.0 - current_df.loc[mask, "homewinprob"]
+        current_df.loc[mask, "homespread"] = np.where(fbs_home, -fbs_margin, fbs_margin)
+        current_df.loc[mask, "awayspread"] = -current_df.loc[mask, "homespread"]
+
+    for mask, total_model, feature_key in [
+        (total_mask, "fcs_total_with_total", "fcs_total_features"),
+        (no_total_mask, "fcs_total_no_total", "fcs_base_features"),
+    ]:
+        if not mask.any():
+            continue
+        features = modeled_df.attrs[feature_key]
+        current_df.loc[mask, "totalpred"] = model_bundle[total_model].predict(
+            current_df.loc[mask, features]
+        )
 
 
 def score_current_season(model_bundle: dict, modeled_df: pd.DataFrame, current_season: int) -> pd.DataFrame:
@@ -688,42 +547,11 @@ def score_current_season(model_bundle: dict, modeled_df: pd.DataFrame, current_s
     if current_df.empty:
         raise RuntimeError(f"No rows found for current season {current_season}.")
 
-    current_df["homewinprob_with_spread"] = model_bundle["win_line"].predict_proba(
-        current_df[modeled_df.attrs["win_line_features"]]
-    )[:, 1]
-    current_df["homewinprob_without_spread"] = model_bundle["win_model_2"].predict_proba(
-        current_df[modeled_df.attrs["win_model_2_features"]]
-    )[:, 1]
-    current_df["homespread_with_spread"] = -model_bundle["spread_line"].predict(
-        current_df[modeled_df.attrs["spread_line_features"]]
-    )
-    current_df["homespread_without_spread"] = -model_bundle["spread_model_2"].predict(
-        current_df[modeled_df.attrs["spread_model_2_features"]]
-    )
-    current_df["totalpred_with_total"] = model_bundle["total_line"].predict(
-        current_df[modeled_df.attrs["total_line_features"]]
-    )
-    current_df["totalpred_without_total"] = model_bundle["total_model_2"].predict(
-        current_df[modeled_df.attrs["total_model_2_features"]]
-    )
+    for col in ["homewinprob", "awaywinprob", "homespread", "awayspread", "totalpred"]:
+        current_df[col] = np.nan
 
-    current_df["homewinprob"] = np.where(
-        current_df["has_spread_line"],
-        current_df["homewinprob_with_spread"],
-        current_df["homewinprob_without_spread"],
-    )
-    current_df["homespread"] = np.where(
-        current_df["has_spread_line"],
-        current_df["homespread_with_spread"],
-        current_df["homespread_without_spread"],
-    )
-    current_df["totalpred"] = np.where(
-        current_df["has_total_line"],
-        current_df["totalpred_with_total"],
-        current_df["totalpred_without_total"],
-    )
-    current_df["awaywinprob"] = 1.0 - current_df["homewinprob"]
-    current_df["awayspread"] = -current_df["homespread"]
+    _score_fbs_rows(current_df, modeled_df, model_bundle)
+    _score_fcs_rows(current_df, modeled_df, model_bundle)
     return current_df.sort_values(["week", "id"]).reset_index(drop=True)
 
 
@@ -796,18 +624,34 @@ def ensure_predictions_table(conn) -> None:
     conn.commit()
 
 
+def _row_model_version(output: pd.DataFrame) -> np.ndarray:
+    is_fcs = output["prediction_type"].eq(FCS_PREDICTION_TYPE)
+    fully_line_aware = output["has_spread_line"].astype(bool) & output["has_total_line"].astype(bool)
+    return np.select(
+        [
+            is_fcs & fully_line_aware,
+            is_fcs & ~fully_line_aware,
+            ~is_fcs & fully_line_aware,
+            ~is_fcs & ~fully_line_aware,
+        ],
+        [
+            XGB_FCS_AWARE_MODEL_VERSION,
+            XGB_FCS_INCOMPLETE_MODEL_VERSION,
+            XGB_FBS_AWARE_MODEL_VERSION,
+            XGB_FBS_INCOMPLETE_MODEL_VERSION,
+        ],
+        default=XGB_FBS_INCOMPLETE_MODEL_VERSION,
+    )
+
+
 def prediction_records(preds: pd.DataFrame) -> list[dict]:
     output = preds.copy()
     output["gameid"] = output["id"].astype(str)
     output["home_team"] = output["hometeam"]
     output["away_team"] = output["awayteam"]
-    output["model_version"] = np.where(
-        output["has_spread_line"].astype(bool) & output["has_total_line"].astype(bool),
-        LINE_AWARE_MODEL_VERSION,
-        INCOMPLETE_MODEL_VERSION,
-    )
     if "prediction_type" not in output.columns:
         output["prediction_type"] = FBS_PREDICTION_TYPE
+    output["model_version"] = _row_model_version(output)
     output = output[
         [
             "gameid",

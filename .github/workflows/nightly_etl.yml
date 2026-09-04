@@ -78,6 +78,12 @@ jobs:
           SEASON: ${{ github.event.inputs.season }}
         run: python -m etl.jobs.nightly_data_updates.update_fpi
 
+      - name: Update TeamRankings predictive ratings table
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          SEASON: ${{ github.event.inputs.season }}
+        run: python -m etl.jobs.nightly_data_updates.update_teamrankings_predictive
+
       - name: Update transfer portal table
         env:
           PG_DSN: ${{ secrets.PG_DSN }}

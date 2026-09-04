@@ -23,20 +23,12 @@ import psycopg
 
 from etl.common_config import load_config
 from etl.jobs.prediction_updates.update_game_predictions import (
-    BASE_DIFF_FEATURES,
     FCS_PREDICTION_TYPE,
-    INCOMPLETE_MODEL_VERSION,
-    LINE_AWARE_MODEL_VERSION,
-    MODEL_2_EXTRA_DIFF_FEATURES,
-    assign_prediction_type,
-    build_linear_pipeline,
-    build_logistic_pipeline,
     build_modeling_table,
-    fill_fcs_advanced_inputs_with_baselines,
-    fill_preseason_inputs_with_second_fbs_averages,
-    fill_week1_advanced_diffs_with_auxiliary_models,
+    MODEL_VERSION_LABELS,
     prediction_records,
     score_current_season,
+    train_models_for_mask,
 )
 
 
@@ -281,7 +273,7 @@ def _run_type_from_env() -> str:
 
 
 def _model_version_label() -> str:
-    return f"{LINE_AWARE_MODEL_VERSION}+{INCOMPLETE_MODEL_VERSION}"
+    return "+".join(MODEL_VERSION_LABELS)
 
 
 def _as_of_training_mask(df, current_season: int, as_of_date: date):
@@ -296,108 +288,22 @@ def _as_of_training_mask(df, current_season: int, as_of_date: date):
 
 
 def train_models_as_of(df, current_season: int, as_of_date: date):
-    df = df.copy()
-    assign_prediction_type(df)
-    df["has_spread_line"] = df["avg_spread"].notna() if "avg_spread" in df.columns else False
-    df["has_total_line"] = df["avg_over_under"].notna() if "avg_over_under" in df.columns else False
-
-    fill_preseason_inputs_with_second_fbs_averages(df, current_season)
-    fill_fcs_advanced_inputs_with_baselines(df, current_season)
-    fill_week1_advanced_diffs_with_auxiliary_models(df, current_season)
-
-    model_1_spread_features = ["avg_spread"] + BASE_DIFF_FEATURES
-    model_1_total_features = ["avg_over_under"] + BASE_DIFF_FEATURES
-    model_2_features = BASE_DIFF_FEATURES + MODEL_2_EXTRA_DIFF_FEATURES
-    model_numeric_cols = sorted(
-        set(model_1_spread_features + model_1_total_features + model_2_features)
-    )
-
-    for col in model_numeric_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    df["spread_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        - pd.to_numeric(df["awaypoints"], errors="coerce")
-    )
-    df["win_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        > pd.to_numeric(df["awaypoints"], errors="coerce")
-    ).astype(float)
-    df["total_points_target"] = (
-        pd.to_numeric(df["homepoints"], errors="coerce")
-        + pd.to_numeric(df["awaypoints"], errors="coerce")
-    )
-
     train_mask = _as_of_training_mask(df, current_season, as_of_date)
-    train_df = df[train_mask & df["homepoints"].notna() & df["awaypoints"].notna()].copy()
-    if train_df.empty:
-        raise RuntimeError("No completed games available for model training.")
-
+    completed = df["homepoints"].notna() & df["awaypoints"].notna()
     current_train_count = int(
-        pd.to_numeric(train_df["season"], errors="coerce").eq(current_season).sum()
+        pd.to_numeric(df.loc[train_mask & completed, "season"], errors="coerce")
+        .eq(current_season)
+        .sum()
     )
-    print(
-        f"Training through {as_of_date.isoformat()} "
-        f"({current_train_count} completed {current_season} games included)."
+    return train_models_for_mask(
+        df,
+        current_season,
+        train_mask,
+        training_message=(
+            f"Training through {as_of_date.isoformat()} "
+            f"({current_train_count} completed {current_season} games included)."
+        ),
     )
-
-    train_df_spread_line = train_df[train_df["has_spread_line"]].copy()
-    train_df_total_line = train_df[train_df["has_total_line"]].copy()
-    if train_df_spread_line.empty:
-        raise RuntimeError("No historical games with spread data available for line-aware win/spread models.")
-    if train_df_total_line.empty:
-        raise RuntimeError("No historical games with total-line data available for line-aware total model.")
-
-    model_bundle = {
-        "win_line": build_logistic_pipeline(model_1_spread_features),
-        "spread_line": build_linear_pipeline(model_1_spread_features),
-        "total_line": build_linear_pipeline(model_1_total_features),
-        "win_model_2": build_logistic_pipeline(model_2_features),
-        "spread_model_2": build_linear_pipeline(model_2_features),
-        "total_model_2": build_linear_pipeline(model_2_features),
-    }
-
-    print(f"Training WIN model (line-aware) on {len(train_df_spread_line)} rows...")
-    model_bundle["win_line"].fit(
-        train_df_spread_line[model_1_spread_features],
-        train_df_spread_line["win_target"].astype(int),
-    )
-    print(f"Training SPREAD model (line-aware) on {len(train_df_spread_line)} rows...")
-    model_bundle["spread_line"].fit(
-        train_df_spread_line[model_1_spread_features],
-        train_df_spread_line["spread_target"].astype(float),
-    )
-    print(f"Training TOTAL model (line-aware) on {len(train_df_total_line)} rows...")
-    model_bundle["total_line"].fit(
-        train_df_total_line[model_1_total_features],
-        train_df_total_line["total_points_target"].astype(float),
-    )
-
-    print(f"Training WIN model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["win_model_2"].fit(
-        train_df[model_2_features],
-        train_df["win_target"].astype(int),
-    )
-    print(f"Training SPREAD model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["spread_model_2"].fit(
-        train_df[model_2_features],
-        train_df["spread_target"].astype(float),
-    )
-    print(f"Training TOTAL model (Model 2, no line) on {len(train_df)} rows...")
-    model_bundle["total_model_2"].fit(
-        train_df[model_2_features],
-        train_df["total_points_target"].astype(float),
-    )
-
-    df.attrs["win_line_features"] = model_1_spread_features
-    df.attrs["spread_line_features"] = model_1_spread_features
-    df.attrs["total_line_features"] = model_1_total_features
-    df.attrs["win_model_2_features"] = model_2_features
-    df.attrs["spread_model_2_features"] = model_2_features
-    df.attrs["total_model_2_features"] = model_2_features
-    return model_bundle, df
 
 
 def filter_predictions_for_run_type(
@@ -410,7 +316,12 @@ def filter_predictions_for_run_type(
     if run_type == "backfill":
         target_date = target_game_date or run_date + timedelta(days=1)
         return preds[gamedate.eq(target_date)].copy()
-    return preds[gamedate.gt(run_date) & preds["homepoints"].isna() & preds["awaypoints"].isna()].copy()
+    completed_before_run = (
+        preds["homepoints"].notna()
+        & preds["awaypoints"].notna()
+        & gamedate.lt(run_date)
+    )
+    return preds[~completed_before_run].copy()
 
 
 def backfill_game_dates(df, current_season: int) -> list[date]:

@@ -1,6 +1,7 @@
 # --- Environment Variables ---
 .env
 etl/.env
+etl/secrets.env
 
 # --- Python ---
 __pycache__/

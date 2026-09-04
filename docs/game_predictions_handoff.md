@@ -84,7 +84,7 @@ Important fields:
 - `created_at`: when the run metadata row was created in the database.
 - `completed_at`: when the run was marked `success`, `duplicate`, or `failed`.
 - `status`: one of `running`, `success`, `duplicate`, or `failed`.
-- `model_version`: currently a combined label of the two row-level model labels: `aware_2026+incomplete_2026`.
+- `model_version`: currently a combined label of the row-level XGBoost model labels.
 - `prediction_hash`: SHA-256 hash of the canonical prediction payload for the run. Used to detect duplicate snapshots.
 - `duplicate_of_run_id`: populated when this run produced the same prediction hash as the latest comparable successful run.
 - `row_count`: number of game predictions prepared for the run, even if the run later becomes a duplicate.
@@ -157,7 +157,7 @@ Important fields:
 - `totalpred`: model prediction for total points in the game.
 - `homewinprob`: model probability that the home team wins, from `0.0` to `1.0`.
 - `awaywinprob`: exact complement of `homewinprob`, calculated as `1.0 - homewinprob`.
-- `model_version`: row-level model version label. Currently either `aware_2026` or `incomplete_2026`.
+- `model_version`: row-level model version label. Currently one of the FBS/FCS XGBoost labels.
 - `prediction_type`: `FBS` or `FCS`. `FCS` means at least one team in the game is classified as FCS.
 - `prediction_row_hash`: SHA-256 hash of the canonical row payload, excluding final scores.
 - `created_at`: database insert timestamp for the detail row.
@@ -347,7 +347,7 @@ Duplicate runs are meaningful metadata but do not have their own detail rows. To
 
 ## How The Full Snapshot Job Works
 
-The full snapshot job intentionally reuses the modeling, scoring, and record-shaping functions from the older `prediction_updates/update_game_predictions.py` job. That keeps the model output identical between the old latest-only table and the new full snapshot table.
+The full snapshot job reuses the modeling, training, scoring, and record-shaping functions from `prediction_updates/update_game_predictions.py`. That keeps model output identical between the latest-only table and the full snapshot table.
 
 High-level flow:
 
@@ -393,12 +393,18 @@ After scoring the current season, the full snapshot job filters rows differently
 For `nightly` and `manual` runs:
 
 ```text
-gamedate > run_date
-AND homepoints IS NULL
-AND awaypoints IS NULL
+NOT (
+  gamedate < run_date
+  AND homepoints IS NOT NULL
+  AND awaypoints IS NOT NULL
+)
 ```
 
-So a normal run stores predictions only for future unplayed games.
+So a normal run stores predictions for every game that was not completed before the
+run date. This includes same-date games, even if the score has already landed in
+`game_data`, because the model is trained as of the start of that date and
+downstream snapshot jobs need one complete probability set for all games not yet
+treated as completed.
 
 For `backfill` runs:
 
@@ -513,15 +519,17 @@ It is independent of actual final scores, though final score fields can later be
 
 ### Model Version
 
-There are two row-level model labels:
+There are four row-level model labels:
 
-- `aware_2026`: the game had both spread and total lines available, so the line-aware model output was used.
-- `incomplete_2026`: one or both betting lines were missing, so at least part of the output came from the no-line fallback model.
+- `xgb_fbs_aware_2026`: FBS-vs-FBS game with both spread and total lines available.
+- `xgb_fbs_incomplete_2026`: FBS-vs-FBS game missing one or both betting lines.
+- `xgb_fcs_aware_2026`: FBS-vs-FCS game with both spread and total lines available.
+- `xgb_fcs_incomplete_2026`: FBS-vs-FCS game missing one or both betting lines.
 
 At the run level, `game_prediction_runs.model_version` is a combined label:
 
 ```text
-aware_2026+incomplete_2026
+xgb_fbs_aware_2026+xgb_fbs_incomplete_2026+xgb_fcs_aware_2026+xgb_fcs_incomplete_2026
 ```
 
 Dashboard interpretation:
@@ -536,9 +544,7 @@ Dashboard interpretation:
 - `FBS`: both teams are FBS.
 - `FCS`: at least one team is FCS.
 
-FCS games are included when one side is FBS and the other side is FCS. Pure FCS-vs-FCS games are not included by the modeling query.
-
-The model has special input filling for FCS teams because normal FBS advanced/team inputs are often missing or not comparable.
+FCS games are included when one side is FBS and the other side is FCS. Pure FCS-vs-FCS games are not included by the modeling query. FCS games are modeled from the FBS team's perspective, then converted back into the same home/away dashboard fields.
 
 ## Modeling Inputs
 
@@ -546,10 +552,10 @@ The modeling table pulls data from these Neon tables:
 
 - `public.game_data`
 - `public.betting_odds`
-- `public.team_advanced_game_stats`
 - `public.team_recruiting_rankings`
 - `public.team_talent_composite`
 - `public.team_returning_production`
+- `public.teamrankings_predictive_ratings`
 
 The base game population is:
 
@@ -557,143 +563,82 @@ The base game population is:
 - Games with non-null `startdate`.
 - Games where at least one team is FBS and the other team is FBS or FCS.
 
-The ETL computes away-minus-home feature differences. For example:
+TeamRankings ratings are joined with a strict no-leakage rule:
 
 ```text
-recruiting_diff = away_recruiting_points - home_recruiting_points
-talent_diff = away_talent - home_talent
-returning_diff = away_returning_production_total_ppa - home_returning_production_total_ppa
-offense_ppa_prior_avg_diff = away_offense_ppa_prior_avg - home_offense_ppa_prior_avg
+teamrankings_predictive_ratings.pull_date < game_data.gamedate
 ```
 
-Advanced stats use prior averages only. The SQL window function calculates each team's average before the current game:
+The selected TeamRankings row is the most recent available snapshot before the game date.
 
-```text
-ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-```
+### FBS-vs-FBS Features
 
-That avoids using the current game's advanced stats to predict itself.
+The FBS model family uses raw home/away team features:
 
-### Base Features
+- `home_teamrankings_rating`
+- `away_teamrankings_rating`
+- `home_talent`
+- `away_talent`
+- `home_recruiting_points`
+- `away_recruiting_points`
+- `home_returning_total_ppa`
+- `away_returning_total_ppa`
+- `home_returning_percent_ppa`
+- `away_returning_percent_ppa`
+- `neutral_site`
 
-The base feature set is:
+Spread-aware win/spread models also use `avg_spread`. Total-aware total models also use `avg_over_under`.
 
-- `recruiting_diff`
-- `talent_diff`
-- `returning_diff`
-- `offense_ppa_prior_avg_diff`
-- `offense_totalppa_prior_avg_diff`
-- `offense_successrate_prior_avg_diff`
-- `offense_explosiveness_prior_avg_diff`
-- `defense_ppa_prior_avg_diff`
-- `defense_totalppa_prior_avg_diff`
-- `defense_successrate_prior_avg_diff`
-- `defense_explosiveness_prior_avg_diff`
+### FBS-vs-FCS Features
 
-### Extra No-Line Features
+The FCS model family uses only the FBS team's features:
 
-The no-line fallback model also uses:
+- `fbs_teamrankings_rating`
+- `fbs_talent`
+- `fbs_recruiting_points`
+- `fbs_returning_total_ppa`
+- `fbs_returning_percent_ppa`
+- `fbs_is_home`
+- `neutral_site`
+- `is_fcs_game`
 
-- `offense_stuffrate_prior_avg_diff`
-- `offense_openfieldyardstotal_prior_avg_diff`
-- `offense_standarddowns_ppa_prior_avg_diff`
-- `offense_standarddowns_successrate_prior_avg_diff`
-- `offense_passingdowns_ppa_prior_avg_diff`
-- `offense_passingdowns_successrate_prior_avg_diff`
-- `offense_rushingplays_totalppa_prior_avg_diff`
-- `offense_rushingplays_successrate_prior_avg_diff`
-- `offense_rushingplays_explosiveness_prior_avg_diff`
-- `offense_passingplays_totalppa_prior_avg_diff`
-- `offense_passingplays_explosiveness_prior_avg_diff`
-- `defense_plays_prior_avg_diff`
-- `defense_drives_prior_avg_diff`
-- `defense_powersuccess_prior_avg_diff`
-- `defense_secondlevelyardstotal_prior_avg_diff`
-- `defense_standarddowns_ppa_prior_avg_diff`
-- `defense_passingdowns_successrate_prior_avg_diff`
-- `defense_passingdowns_explosiveness_prior_avg_diff`
-- `defense_rushingplays_ppa_prior_avg_diff`
-- `defense_passingplays_totalppa_prior_avg_diff`
-- `defense_passingplays_explosiveness_prior_avg_diff`
+Spread-aware FCS win/margin models also use `fbs_spread`, which converts the home spread into the FBS team's perspective. Total-aware FCS total models also use `avg_over_under`.
 
 ## Modeling Strategy
 
-The job trains six models:
+The job trains 12 XGBoost models:
 
-- Line-aware home win probability model.
-- Line-aware spread model.
-- Line-aware total model.
-- No-line/fallback home win probability model.
-- No-line/fallback spread model.
-- No-line/fallback total model.
+- FBS win with spread.
+- FBS win without spread.
+- FBS spread with spread.
+- FBS spread without spread.
+- FBS total with total.
+- FBS total without total.
+- FCS FBS-team win with spread.
+- FCS FBS-team win without spread.
+- FCS FBS-team margin with spread.
+- FCS FBS-team margin without spread.
+- FCS total with total.
+- FCS total without total.
 
-Model types:
+Win models use `XGBClassifier`. Spread, margin, and total models use `XGBRegressor`.
 
-- Win probability uses logistic regression.
-- Spread and total use linear regression.
-- All models standardize numeric inputs with `StandardScaler` inside a scikit-learn pipeline.
-
-Line-aware models:
-
-- Win and spread use `avg_spread` plus the base features.
-- Total uses `avg_over_under` plus the base features.
-- The line-aware win/spread models train only on completed training games with spread data.
-- The line-aware total model trains only on completed training games with total-line data.
-
-No-line fallback models:
-
-- Use base features plus the extra advanced feature set.
-- Train on all completed training games.
-- Do not require betting lines.
+Local macOS runs require an arm64 OpenMP runtime for the XGBoost wheel. If model construction fails with a missing `libomp.dylib` message, install an arm64 `libomp` runtime before running the prediction job locally. The GitHub Actions job runs on Ubuntu and installs the Python dependency from `etl/requirements.txt`.
 
 Scoring selection:
 
-- If a game has a spread line, `homewinprob` and `homespread` come from the line-aware models.
-- If a game lacks a spread line, `homewinprob` and `homespread` come from the no-line fallback models.
-- If a game has a total line, `totalpred` comes from the line-aware total model.
-- If a game lacks a total line, `totalpred` comes from the no-line fallback total model.
+- FBS-vs-FBS games use the FBS family.
+- FBS-vs-FCS games use the FCS family.
+- Win/spread use line-aware models when `avg_spread` exists.
+- Win/spread use no-spread models when `avg_spread` is missing.
+- Total uses the total-aware model when `avg_over_under` exists.
+- Total uses the no-total model when `avg_over_under` is missing.
 
-The row-level `model_version` is `aware_2026` only when both spread and total lines exist. Otherwise it is `incomplete_2026`.
+For FBS-vs-FCS games, the model predicts FBS-team win probability and FBS-team margin. The scoring function maps those predictions back to `homewinprob`, `awaywinprob`, `homespread`, and `awayspread` while preserving betting notation.
 
 ## Missing Data And Special Cases
 
-### Current-Season Missing Preseason Inputs
-
-For current-season FBS teams missing recruiting, talent, or returning production values, the job first tries to fill from the team's latest historical value.
-
-Remaining missing FBS values are filled with averages from historical second-FBS-season teams. If that is unavailable, the job falls back to broader historical averages and then `0.0`.
-
-### FCS Teams
-
-FCS teams receive special fills:
-
-- Recruiting: `0.0`
-- Talent: `0.0`
-- Returning production: historical FBS 10th percentile
-
-For advanced prior averages, FCS teams receive historical FBS quantile baselines:
-
-- Defensive metrics and `offense_stuffrate`: 95th percentile.
-- Other metrics: 5th percentile.
-
-The intent is to make FCS teams look weak relative to FBS teams without requiring missing FCS advanced data.
-
-### Week 1 Advanced Prior Averages
-
-Week 1 games often lack prior in-season advanced averages. The job uses auxiliary linear models to fill missing Week 1 advanced-difference features.
-
-For each advanced feature:
-
-- The target is the same metric's actual game-level away-minus-home difference.
-- Training data comes from historical Week 1 games with known actual advanced values.
-- If the prediction row has betting lines, the auxiliary model tries preseason inputs plus `avg_spread` and `avg_over_under`.
-- If that is unavailable or insufficient, it falls back to preseason inputs only.
-
-Minimum auxiliary training rows:
-
-```text
-10
-```
+XGBoost handles missing feature values natively, so the prediction job no longer runs advanced-stat prior imputation or Week 1 auxiliary models. FBS-vs-FCS rows only require feature inputs for the FBS side.
 
 ## Dashboard Implementation Notes
 
