@@ -521,15 +521,19 @@ It is independent of actual final scores, though final score fields can later be
 
 There are four row-level model labels:
 
-- `xgb_fbs_aware_2026`: FBS-vs-FBS game with both spread and total lines available.
-- `xgb_fbs_incomplete_2026`: FBS-vs-FBS game missing one or both betting lines.
-- `xgb_fcs_aware_2026`: FBS-vs-FCS game with both spread and total lines available.
-- `xgb_fcs_incomplete_2026`: FBS-vs-FCS game missing one or both betting lines.
+- `xgb_fbs_aware_2026_v2`: FBS-vs-FBS game with both spread and total lines available.
+- `xgb_fbs_incomplete_2026_v2`: FBS-vs-FBS game missing one or both betting lines.
+- `xgb_fcs_aware_2026_v2`: FBS-vs-FCS game with both spread and total lines available.
+- `xgb_fcs_incomplete_2026_v2`: FBS-vs-FCS game missing one or both betting lines.
+
+For 2026, the `_v2` labels mean returning production metrics are no longer used as model
+covariates. The fields are still available in the modeling table for future analysis and
+model experiments.
 
 At the run level, `game_prediction_runs.model_version` is a combined label:
 
 ```text
-xgb_fbs_aware_2026+xgb_fbs_incomplete_2026+xgb_fcs_aware_2026+xgb_fcs_incomplete_2026
+xgb_fbs_aware_2026_v2+xgb_fbs_incomplete_2026_v2+xgb_fcs_aware_2026_v2+xgb_fcs_incomplete_2026_v2
 ```
 
 Dashboard interpretation:
@@ -581,10 +585,6 @@ The FBS model family uses raw home/away team features:
 - `away_talent`
 - `home_recruiting_points`
 - `away_recruiting_points`
-- `home_returning_total_ppa`
-- `away_returning_total_ppa`
-- `home_returning_percent_ppa`
-- `away_returning_percent_ppa`
 - `neutral_site`
 
 Spread-aware win/spread models also use `avg_spread`. Total-aware total models also use `avg_over_under`.
@@ -596,8 +596,6 @@ The FCS model family uses only the FBS team's features:
 - `fbs_teamrankings_rating`
 - `fbs_talent`
 - `fbs_recruiting_points`
-- `fbs_returning_total_ppa`
-- `fbs_returning_percent_ppa`
 - `fbs_is_home`
 - `neutral_site`
 - `is_fcs_game`

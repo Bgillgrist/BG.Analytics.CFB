@@ -26,10 +26,10 @@ from etl.common_config import load_config
 
 warnings.simplefilter("ignore", PerformanceWarning)
 
-XGB_FBS_AWARE_MODEL_VERSION = "xgb_fbs_aware_2026"
-XGB_FBS_INCOMPLETE_MODEL_VERSION = "xgb_fbs_incomplete_2026"
-XGB_FCS_AWARE_MODEL_VERSION = "xgb_fcs_aware_2026"
-XGB_FCS_INCOMPLETE_MODEL_VERSION = "xgb_fcs_incomplete_2026"
+XGB_FBS_AWARE_MODEL_VERSION = "xgb_fbs_aware_2026_v2"
+XGB_FBS_INCOMPLETE_MODEL_VERSION = "xgb_fbs_incomplete_2026_v2"
+XGB_FCS_AWARE_MODEL_VERSION = "xgb_fcs_aware_2026_v2"
+XGB_FCS_INCOMPLETE_MODEL_VERSION = "xgb_fcs_incomplete_2026_v2"
 MODEL_VERSION_LABELS = (
     XGB_FBS_AWARE_MODEL_VERSION,
     XGB_FBS_INCOMPLETE_MODEL_VERSION,
@@ -53,10 +53,6 @@ FBS_BASE_FEATURES = [
     "away_talent",
     "home_recruiting_points",
     "away_recruiting_points",
-    "home_returning_total_ppa",
-    "away_returning_total_ppa",
-    "home_returning_percent_ppa",
-    "away_returning_percent_ppa",
     "neutral_site",
 ]
 FBS_SPREAD_FEATURES = ["avg_spread"] + FBS_BASE_FEATURES
@@ -66,8 +62,6 @@ FCS_BASE_FEATURES = [
     "fbs_teamrankings_rating",
     "fbs_talent",
     "fbs_recruiting_points",
-    "fbs_returning_total_ppa",
-    "fbs_returning_percent_ppa",
     "fbs_is_home",
     "neutral_site",
     "is_fcs_game",
@@ -235,6 +229,10 @@ def prepare_modeling_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 "awaypoints",
                 "home_teamrankings_rank",
                 "away_teamrankings_rank",
+                "home_returning_total_ppa",
+                "away_returning_total_ppa",
+                "home_returning_percent_ppa",
+                "away_returning_percent_ppa",
                 "home_returning_usage",
                 "away_returning_usage",
             ]
