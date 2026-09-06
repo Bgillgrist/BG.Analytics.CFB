@@ -51,8 +51,6 @@ FBS_BASE_FEATURES = [
     "away_teamrankings_rating",
     "home_talent",
     "away_talent",
-    "home_recruiting_points",
-    "away_recruiting_points",
     "neutral_site",
 ]
 FBS_SPREAD_FEATURES = ["avg_spread"] + FBS_BASE_FEATURES
@@ -61,7 +59,6 @@ FBS_TOTAL_FEATURES = ["avg_over_under"] + FBS_BASE_FEATURES
 FCS_BASE_FEATURES = [
     "fbs_teamrankings_rating",
     "fbs_talent",
-    "fbs_recruiting_points",
     "fbs_is_home",
     "neutral_site",
     "is_fcs_game",
@@ -229,6 +226,8 @@ def prepare_modeling_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 "awaypoints",
                 "home_teamrankings_rank",
                 "away_teamrankings_rank",
+                "home_recruiting_points",
+                "away_recruiting_points",
                 "home_returning_total_ppa",
                 "away_returning_total_ppa",
                 "home_returning_percent_ppa",

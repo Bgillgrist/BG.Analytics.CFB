@@ -145,6 +145,11 @@ class XgbGamePredictionTests(unittest.TestCase):
         modeled = _attach_feature_attrs(job.prepare_modeling_dataframe(df))
         models = _model_bundle()
 
+        self.assertNotIn("home_recruiting_points", job.FBS_BASE_FEATURES)
+        self.assertNotIn("away_recruiting_points", job.FBS_BASE_FEATURES)
+        self.assertNotIn("fbs_recruiting_points", job.FCS_BASE_FEATURES)
+        self.assertIn("fbs_recruiting_points", modeled.columns)
+
         preds = job.score_current_season(models, modeled, 2026).set_index("id")
 
         self.assertAlmostEqual(preds.loc[1, "homewinprob"], 0.71)
