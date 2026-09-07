@@ -572,7 +572,7 @@ def process_prediction_snapshot(
         print(f"Backfill target game date: {target_game_date}")
 
     model_bundle, modeled_df = train_models_as_of(df, current_season, run_date)
-    preds = score_current_season(model_bundle, modeled_df, current_season)
+    preds = score_current_season(model_bundle, modeled_df, current_season, run_date=run_date)
     preds = filter_predictions_for_run_type(
         preds,
         run_type,

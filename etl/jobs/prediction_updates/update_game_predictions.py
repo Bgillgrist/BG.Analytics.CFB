@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import warnings
+from datetime import date, datetime, timezone
 
 # Keep model runs single-threaded to avoid OpenMP SHM issues in small runners.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -470,12 +471,45 @@ def _predict_probability(model, frame: pd.DataFrame, feature_cols: list[str]) ->
     return model.predict_proba(frame[feature_cols])[:, 1]
 
 
+def _effective_run_date(run_date: date | None) -> date:
+    return run_date or datetime.now(timezone.utc).date()
+
+
+def _next_upcoming_week(current_df: pd.DataFrame, run_date: date) -> int | None:
+    if "gamedate" not in current_df.columns or "week" not in current_df.columns:
+        return None
+
+    gamedate = pd.to_datetime(current_df["gamedate"], errors="coerce").dt.date
+    completed = current_df["homepoints"].notna() & current_df["awaypoints"].notna()
+    upcoming = ~completed & gamedate.notna() & gamedate.ge(run_date)
+    weeks = pd.to_numeric(current_df.loc[upcoming, "week"], errors="coerce").dropna()
+    if weeks.empty:
+        return None
+    return int(weeks.min())
+
+
+def _assign_line_usage_flags(current_df: pd.DataFrame, run_date: date) -> None:
+    next_week = _next_upcoming_week(current_df, run_date)
+    week = pd.to_numeric(current_df["week"], errors="coerce")
+    is_next_upcoming_week = (
+        week.eq(next_week)
+        if next_week is not None
+        else pd.Series(False, index=current_df.index)
+    )
+    current_df["use_spread_line"] = (
+        current_df["has_spread_line"].astype(bool) & is_next_upcoming_week
+    )
+    current_df["use_total_line"] = (
+        current_df["has_total_line"].astype(bool) & is_next_upcoming_week
+    )
+
+
 def _score_fbs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bundle: dict) -> None:
     fbs_mask = current_df["prediction_type"].eq(FBS_PREDICTION_TYPE)
-    spread_mask = fbs_mask & current_df["has_spread_line"].astype(bool)
-    no_spread_mask = fbs_mask & ~current_df["has_spread_line"].astype(bool)
-    total_mask = fbs_mask & current_df["has_total_line"].astype(bool)
-    no_total_mask = fbs_mask & ~current_df["has_total_line"].astype(bool)
+    spread_mask = fbs_mask & current_df["use_spread_line"].astype(bool)
+    no_spread_mask = fbs_mask & ~current_df["use_spread_line"].astype(bool)
+    total_mask = fbs_mask & current_df["use_total_line"].astype(bool)
+    no_total_mask = fbs_mask & ~current_df["use_total_line"].astype(bool)
 
     for mask, win_model, spread_model, feature_key in [
         (spread_mask, "fbs_win_with_spread", "fbs_spread_with_spread", "fbs_spread_features"),
@@ -506,10 +540,10 @@ def _score_fbs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bu
 
 def _score_fcs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bundle: dict) -> None:
     fcs_mask = current_df["prediction_type"].eq(FCS_PREDICTION_TYPE)
-    spread_mask = fcs_mask & current_df["has_spread_line"].astype(bool)
-    no_spread_mask = fcs_mask & ~current_df["has_spread_line"].astype(bool)
-    total_mask = fcs_mask & current_df["has_total_line"].astype(bool)
-    no_total_mask = fcs_mask & ~current_df["has_total_line"].astype(bool)
+    spread_mask = fcs_mask & current_df["use_spread_line"].astype(bool)
+    no_spread_mask = fcs_mask & ~current_df["use_spread_line"].astype(bool)
+    total_mask = fcs_mask & current_df["use_total_line"].astype(bool)
+    no_total_mask = fcs_mask & ~current_df["use_total_line"].astype(bool)
 
     for mask, win_model, margin_model, feature_key in [
         (spread_mask, "fcs_win_with_spread", "fcs_margin_with_spread", "fcs_spread_features"),
@@ -539,14 +573,22 @@ def _score_fcs_rows(current_df: pd.DataFrame, modeled_df: pd.DataFrame, model_bu
         )
 
 
-def score_current_season(model_bundle: dict, modeled_df: pd.DataFrame, current_season: int) -> pd.DataFrame:
-    current_df = modeled_df[pd.to_numeric(modeled_df["season"], errors="coerce").eq(current_season)].copy()
+def score_current_season(
+    model_bundle: dict,
+    modeled_df: pd.DataFrame,
+    current_season: int,
+    run_date: date | None = None,
+) -> pd.DataFrame:
+    current_df = modeled_df[
+        pd.to_numeric(modeled_df["season"], errors="coerce").eq(current_season)
+    ].copy()
     if current_df.empty:
         raise RuntimeError(f"No rows found for current season {current_season}.")
 
     for col in ["homewinprob", "awaywinprob", "homespread", "awayspread", "totalpred"]:
         current_df[col] = np.nan
 
+    _assign_line_usage_flags(current_df, _effective_run_date(run_date))
     _score_fbs_rows(current_df, modeled_df, model_bundle)
     _score_fcs_rows(current_df, modeled_df, model_bundle)
     return current_df.sort_values(["week", "id"]).reset_index(drop=True)
@@ -623,7 +665,15 @@ def ensure_predictions_table(conn) -> None:
 
 def _row_model_version(output: pd.DataFrame) -> np.ndarray:
     is_fcs = output["prediction_type"].eq(FCS_PREDICTION_TYPE)
-    fully_line_aware = output["has_spread_line"].astype(bool) & output["has_total_line"].astype(bool)
+    spread_line_col = (
+        "use_spread_line" if "use_spread_line" in output.columns else "has_spread_line"
+    )
+    total_line_col = (
+        "use_total_line" if "use_total_line" in output.columns else "has_total_line"
+    )
+    spread_line_used = output[spread_line_col].astype(bool)
+    total_line_used = output[total_line_col].astype(bool)
+    fully_line_aware = spread_line_used & total_line_used
     return np.select(
         [
             is_fcs & fully_line_aware,

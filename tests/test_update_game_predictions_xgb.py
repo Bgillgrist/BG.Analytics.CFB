@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -74,6 +75,7 @@ class XgbGamePredictionTests(unittest.TestCase):
                     "id": 1,
                     "season": 2026,
                     "week": 1,
+                    "gamedate": "2026-09-12",
                     "hometeam": "A",
                     "awayteam": "B",
                     "homeclassification": "fbs",
@@ -88,6 +90,7 @@ class XgbGamePredictionTests(unittest.TestCase):
                     "id": 2,
                     "season": 2026,
                     "week": 1,
+                    "gamedate": "2026-09-12",
                     "hometeam": "C",
                     "awayteam": "D",
                     "homeclassification": "fbs",
@@ -102,6 +105,7 @@ class XgbGamePredictionTests(unittest.TestCase):
                     "id": 3,
                     "season": 2026,
                     "week": 1,
+                    "gamedate": "2026-09-12",
                     "hometeam": "E",
                     "awayteam": "FCS One",
                     "homeclassification": "fbs",
@@ -116,6 +120,7 @@ class XgbGamePredictionTests(unittest.TestCase):
                     "id": 4,
                     "season": 2026,
                     "week": 1,
+                    "gamedate": "2026-09-12",
                     "hometeam": "FCS Two",
                     "awayteam": "G",
                     "homeclassification": "fcs",
@@ -150,7 +155,9 @@ class XgbGamePredictionTests(unittest.TestCase):
         self.assertNotIn("fbs_recruiting_points", job.FCS_BASE_FEATURES)
         self.assertIn("fbs_recruiting_points", modeled.columns)
 
-        preds = job.score_current_season(models, modeled, 2026).set_index("id")
+        preds = job.score_current_season(
+            models, modeled, 2026, run_date=date(2026, 9, 6)
+        ).set_index("id")
 
         self.assertAlmostEqual(preds.loc[1, "homewinprob"], 0.71)
         self.assertAlmostEqual(preds.loc[1, "homespread"], -4.0)
@@ -175,6 +182,97 @@ class XgbGamePredictionTests(unittest.TestCase):
         self.assertEqual(models["fbs_win_no_spread"].row_count, 1)
         self.assertEqual(models["fcs_win_with_spread"].row_count, 1)
         self.assertEqual(models["fcs_win_no_spread"].row_count, 1)
+
+    def test_line_aware_models_only_score_next_upcoming_week(self):
+        df = pd.DataFrame(
+            [
+                {
+                    "id": 1,
+                    "season": 2026,
+                    "week": 2,
+                    "gamedate": "2026-09-12",
+                    "hometeam": "A",
+                    "awayteam": "B",
+                    "homeclassification": "fbs",
+                    "awayclassification": "fbs",
+                    "homepoints": None,
+                    "awaypoints": None,
+                    "avg_spread": -3.5,
+                    "avg_over_under": 50.5,
+                    "neutralsite": False,
+                },
+                {
+                    "id": 2,
+                    "season": 2026,
+                    "week": 3,
+                    "gamedate": "2026-09-19",
+                    "hometeam": "C",
+                    "awayteam": "D",
+                    "homeclassification": "fbs",
+                    "awayclassification": "fbs",
+                    "homepoints": None,
+                    "awaypoints": None,
+                    "avg_spread": -7.5,
+                    "avg_over_under": 55.5,
+                    "neutralsite": False,
+                },
+                {
+                    "id": 3,
+                    "season": 2026,
+                    "week": 2,
+                    "gamedate": "2026-09-12",
+                    "hometeam": "E",
+                    "awayteam": "F",
+                    "homeclassification": "fbs",
+                    "awayclassification": "fbs",
+                    "homepoints": None,
+                    "awaypoints": None,
+                    "avg_spread": None,
+                    "avg_over_under": None,
+                    "neutralsite": False,
+                },
+            ]
+        )
+        for col in [
+            "home_teamrankings_rating",
+            "away_teamrankings_rating",
+            "home_talent",
+            "away_talent",
+        ]:
+            df[col] = 1.0
+
+        modeled = _attach_feature_attrs(job.prepare_modeling_dataframe(df))
+        models = _model_bundle()
+
+        preds = job.score_current_season(
+            models, modeled, 2026, run_date=date(2026, 9, 6)
+        ).set_index("id")
+
+        self.assertTrue(preds.loc[1, "use_spread_line"])
+        self.assertTrue(preds.loc[1, "use_total_line"])
+        self.assertAlmostEqual(preds.loc[1, "homewinprob"], 0.71)
+        self.assertAlmostEqual(preds.loc[1, "homespread"], -4.0)
+        self.assertAlmostEqual(preds.loc[1, "totalpred"], 55.0)
+
+        self.assertTrue(preds.loc[2, "has_spread_line"])
+        self.assertTrue(preds.loc[2, "has_total_line"])
+        self.assertFalse(preds.loc[2, "use_spread_line"])
+        self.assertFalse(preds.loc[2, "use_total_line"])
+        self.assertAlmostEqual(preds.loc[2, "homewinprob"], 0.61)
+        self.assertAlmostEqual(preds.loc[2, "homespread"], -2.0)
+        self.assertAlmostEqual(preds.loc[2, "totalpred"], 49.0)
+
+        self.assertFalse(preds.loc[3, "use_spread_line"])
+        self.assertFalse(preds.loc[3, "use_total_line"])
+        self.assertAlmostEqual(preds.loc[3, "homewinprob"], 0.61)
+
+        versions = {
+            record["gameid"]: record["model_version"]
+            for record in job.prediction_records(preds.reset_index())
+        }
+        self.assertEqual(versions["1"], job.XGB_FBS_AWARE_MODEL_VERSION)
+        self.assertEqual(versions["2"], job.XGB_FBS_INCOMPLETE_MODEL_VERSION)
+        self.assertEqual(versions["3"], job.XGB_FBS_INCOMPLETE_MODEL_VERSION)
 
     def test_prediction_records_label_fbs_and_fcs_model_versions(self):
         df = pd.DataFrame(

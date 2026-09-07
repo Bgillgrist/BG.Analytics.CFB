@@ -521,14 +521,15 @@ It is independent of actual final scores, though final score fields can later be
 
 There are four row-level model labels:
 
-- `xgb_fbs_aware_2026_v2`: FBS-vs-FBS game with both spread and total lines available.
-- `xgb_fbs_incomplete_2026_v2`: FBS-vs-FBS game missing one or both betting lines.
-- `xgb_fcs_aware_2026_v2`: FBS-vs-FCS game with both spread and total lines available.
-- `xgb_fcs_incomplete_2026_v2`: FBS-vs-FCS game missing one or both betting lines.
+- `xgb_fbs_aware_2026_v2`: FBS-vs-FBS game that used both spread and total lines.
+- `xgb_fbs_incomplete_2026_v2`: FBS-vs-FBS game that did not use both betting lines.
+- `xgb_fcs_aware_2026_v2`: FBS-vs-FCS game that used both spread and total lines.
+- `xgb_fcs_incomplete_2026_v2`: FBS-vs-FCS game that did not use both betting lines.
 
 For 2026, the `_v2` labels mean returning production and recruiting metrics are no
-longer used as model covariates. The fields are still available in the modeling table
-for future analysis and model experiments.
+longer used as model covariates, and betting lines are only used for games in the
+next upcoming schedule week. The removed fields are still available in the modeling
+table for future analysis and model experiments.
 
 At the run level, `game_prediction_runs.model_version` is a combined label:
 
@@ -624,10 +625,11 @@ Scoring selection:
 
 - FBS-vs-FBS games use the FBS family.
 - FBS-vs-FCS games use the FCS family.
-- Win/spread use line-aware models when `avg_spread` exists.
-- Win/spread use no-spread models when `avg_spread` is missing.
-- Total uses the total-aware model when `avg_over_under` exists.
-- Total uses the no-total model when `avg_over_under` is missing.
+- The next upcoming week is the earliest unplayed `week` with `gamedate >= run_date`.
+- Win/spread use line-aware models only for next-upcoming-week games where `avg_spread` exists.
+- Win/spread use no-spread models for later weeks or games missing `avg_spread`.
+- Total uses the total-aware model only for next-upcoming-week games where `avg_over_under` exists.
+- Total uses the no-total model for later weeks or games missing `avg_over_under`.
 
 For FBS-vs-FCS games, the model predicts FBS-team win probability and FBS-team margin. The scoring function maps those predictions back to `homewinprob`, `awaywinprob`, `homespread`, and `awayspread` while preserving betting notation.
 
